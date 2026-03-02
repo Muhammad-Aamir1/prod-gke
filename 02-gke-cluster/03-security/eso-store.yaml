@@ -1,0 +1,16 @@
+# 03-security/eso-store.yaml
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: gcp-store
+  namespace: prod-ns
+spec:
+  provider:
+    gcpsm:
+      projectID: "my-gke-project-3"
+      auth:
+        workloadIdentity:
+          clusterLocation: "us-central1"
+          clusterName: "prod-cluster"
+          serviceAccountRef:
+            name: "backend-ksa" # The KSA we created earlier

@@ -1,0 +1,79 @@
+# ~/prod-gke/03-k8s-manifests/apps/03-frontend.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-web
+  namespace: prod-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      # FINOPS: Pin to Spot Node Pool
+      nodeSelector:
+        finops.tier: frontend
+      # FINOPS: Tolerate the Spot Taint
+      tolerations:
+      - key: "cloud.google.com/gke-spot"
+        operator: "Equal"
+        value: "true"
+        effect: "NO_SCHEDULE"
+      # HIGH AVAILABILITY: Spread across zones
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: frontend
+      containers:
+      - name: web
+        image: nginx:alpine # Placeholder for your React app
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+        env:
+        - name: BACKEND_URL
+          value: "http://backend-svc.prod-ns.svc.cluster.local:8080"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-svc
+  namespace: prod-ns
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+---
+# FINOPS: Auto-scale the frontend based on traffic
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend-hpa
+  namespace: prod-ns
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: frontend-web
+  minReplicas: 3
+  maxReplicas: 15
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

@@ -1,0 +1,93 @@
+# ~/prod-gke/03-k8s-manifests/apps/01-databases.yaml
+---
+# Headless Service for Postgres StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: prod-ns
+spec:
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: prod-ns
+spec:
+  serviceName: "postgres-svc"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # ARCHITECT RULE: Pin DBs to the Standard Node Pool
+      nodeSelector:
+        finops.tier: backend
+      containers:
+      - name: postgres
+        image: postgres:14-alpine
+        env:
+        - name: POSTGRES_USER
+          value: "admin"
+        - name: POSTGRES_PASSWORD
+          value: "supersecret" # In a real scenario, ESO injects this
+        ports:
+        - containerPort: 5432
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+  # Dynamically provisions a standard Persistent Disk on GCP
+  volumeClaimTemplates:
+  - metadata:
+      name: pgdata
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+---
+# Redis Deployment (In-memory cache)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: prod-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      nodeSelector:
+        finops.tier: backend
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-svc
+  namespace: prod-ns
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379

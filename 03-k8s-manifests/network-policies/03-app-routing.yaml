@@ -1,0 +1,47 @@
+# ~/prod-gke/03-k8s-manifests/network-policies/03-app-routing.yaml
+---
+# 1. Allow Frontend -> Backend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: prod-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: backend # Target: Backend Pods
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend # Source: Frontend Pods
+    ports:
+    - protocol: TCP
+      port: 8080 # The port your Backend API listens on
+---
+# 2. Allow Backend -> Databases
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-to-dbs
+  namespace: prod-ns
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["postgres", "redis"] # Target: DB Pods
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: backend # Source: Backend Pods
+    ports:
+    - protocol: TCP
+      port: 5432 # Postgres
+    - protocol: TCP
+      port: 6379 # Redis

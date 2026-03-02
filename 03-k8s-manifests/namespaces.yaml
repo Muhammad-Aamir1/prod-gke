@@ -1,0 +1,18 @@
+# ~/prod-gke/03-k8s-manifests/namespaces.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod-ns
+  labels:
+    environment: production
+    # Security: This rejects any pod trying to run as 'root'
+    pod-security.kubernetes.io/enforce: restricted
+---
+# Security: This links your Kubernetes identity to Google Cloud IAM
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backend-ksa
+  namespace: prod-ns
+  annotations:
+    iam.gke.io/gcp-service-account: app-backend-sa@my-gke-project-3.iam.gserviceaccount.com

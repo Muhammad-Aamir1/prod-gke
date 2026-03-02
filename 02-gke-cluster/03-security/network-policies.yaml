@@ -1,0 +1,66 @@
+# 03-security/network-policies.yaml
+---
+# 1. Allow all Pods in prod-ns to resolve DNS (Critical!)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: prod-ns
+spec:
+  podSelector: {} # Applies to all pods in this namespace
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+# 2. Allow Backend to access Postgres and Redis
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-to-db
+  namespace: prod-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres # Or app: redis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: backend
+    ports:
+    - protocol: TCP
+      port: 5432 # Postgres
+    - protocol: TCP
+      port: 6379 # Redis
+---
+# 3. Allow Frontend to access Backend
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-to-backend
+  namespace: prod-ns
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
