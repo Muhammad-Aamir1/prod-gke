@@ -34,6 +34,10 @@ terraform.tfvars.json
 *.swo
 *~
 
+# Scratch / junk files
+more.txt
+nul.bak
+
 # OS files
 .DS_Store
 Thumbs.db
