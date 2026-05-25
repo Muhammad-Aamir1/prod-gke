@@ -8,7 +8,6 @@ terraform {
 }
 
 provider "google" {
-  project = "test-project2-409608"
-  region  = "us-central1"
-}    
-                                                
+  project = var.service_project_id
+  region  = var.region
+}

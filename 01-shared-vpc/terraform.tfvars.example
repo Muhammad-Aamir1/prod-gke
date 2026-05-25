@@ -1,0 +1,14 @@
+host_project_id       = "test-project2-409608"
+service_project_id    = "my-gke-project-3"
+region                = "us-central1"
+terraform_state_bucket = "my-project-tfstate"
+
+# Optional overrides (defaults shown):
+# vpc_name       = "gke-shared-vpc"
+# subnet_name    = "gke-prod-subnet"
+# subnet_cidr    = "10.0.0.0/20"
+# pod_cidr       = "10.1.0.0/16"
+# svc_cidr       = "10.2.0.0/20"
+# router_name    = "gke2-router"
+# nat_name       = "gke-nat"
+# routing_mode   = "GLOBAL"

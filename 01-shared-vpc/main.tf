@@ -1,37 +1,52 @@
-resource "google_compute_network" "shared_vpc" {
-  name                    = "gke-shared-vpc"
-  auto_create_subnetworks = false
-  routing_mode            = "GLOBAL"
+locals {
+  environment_labels = merge(var.labels, {
+    environment = var.environment
+  })
 }
 
-resource "google_compute_subnetwork" "gke_subnet" {
-  name                     = "gke-prod-subnet"
-  ip_cidr_range            = "10.0.0.0/20"
-  region                   = "us-central1"
-  network                  = google_compute_network.shared_vpc.id
-  private_ip_google_access = true
+module "vpc" {
+  source = "../modules/vpc"
 
-  secondary_ip_range {
-    range_name    = "pod-ranges"
-    ip_cidr_range = "10.1.0.0/16"
-  }
-  secondary_ip_range {
-    range_name    = "svc-ranges"
-    ip_cidr_range = "10.2.0.0/20"
-  }
+  name         = var.vpc_name
+  routing_mode = var.routing_mode
 }
 
-# Cloud Router and NAT for private GKE nodes to reach the internet
-resource "google_compute_router" "router" {
-  name    = "gke2-router"
-  region  = google_compute_subnetwork.gke_subnet.region
-  network = google_compute_network.shared_vpc.id
+moved {
+  from = google_compute_network.shared_vpc
+  to   = module.vpc.google_compute_network.this
 }
 
-resource "google_compute_router_nat" "nat" {
-  name                               = "gke-nat"
-  router                             = google_compute_router.router.name
-  region                             = google_compute_router.router.region
-  nat_ip_allocate_option             = "AUTO_ONLY"
-  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+module "subnet" {
+  source = "../modules/subnet"
+
+  name          = var.subnet_name
+  ip_cidr_range = var.subnet_cidr
+  region        = var.region
+  network_id    = module.vpc.id
+  pod_cidr      = var.pod_cidr
+  svc_cidr      = var.svc_cidr
+}
+
+moved {
+  from = google_compute_subnetwork.gke_subnet
+  to   = module.subnet.google_compute_subnetwork.this
+}
+
+module "nat" {
+  source = "../modules/nat"
+
+  router_name = var.router_name
+  nat_name    = var.nat_name
+  region      = var.region
+  network_id  = module.vpc.id
+}
+
+moved {
+  from = google_compute_router.router
+  to   = module.nat.google_compute_router.this
+}
+
+moved {
+  from = google_compute_router_nat.nat
+  to   = module.nat.google_compute_router_nat.this
 }

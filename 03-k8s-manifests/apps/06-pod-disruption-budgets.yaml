@@ -1,0 +1,44 @@
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend-pdb
+  namespace: prod-ns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: frontend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: prod-ns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: backend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-pdb
+  namespace: prod-ns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: postgres
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+  namespace: prod-ns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: redis

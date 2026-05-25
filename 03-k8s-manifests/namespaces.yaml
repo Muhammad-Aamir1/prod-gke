@@ -1,18 +1,52 @@
-# ~/prod-gke/03-k8s-manifests/namespaces.yaml
+---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: prod-ns
   labels:
     environment: production
-    # Security: This rejects any pod trying to run as 'root'
     pod-security.kubernetes.io/enforce: restricted
 ---
-# Security: This links your Kubernetes identity to Google Cloud IAM
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: backend-ksa
   namespace: prod-ns
   annotations:
-    iam.gke.io/gcp-service-account: app-backend-sa@my-gke-project-3.iam.gserviceaccount.com
+    iam.gke.io/gcp-service-account: app-backend-sa@second-project-497312.iam.gserviceaccount.com
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: prod-quota
+  namespace: prod-ns
+spec:
+  hard:
+    requests.cpu: "4"
+    requests.memory: 8Gi
+    limits.cpu: "8"
+    limits.memory: 16Gi
+    persistentvolumeclaims: 5
+    pods: 50
+    services: 10
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: prod-limits
+  namespace: prod-ns
+spec:
+  limits:
+  - max:
+      cpu: "1"
+      memory: 1Gi
+    min:
+      cpu: 10m
+      memory: 32Mi
+    default:
+      cpu: 100m
+      memory: 128Mi
+    defaultRequest:
+      cpu: 50m
+      memory: 64Mi
+    type: Container

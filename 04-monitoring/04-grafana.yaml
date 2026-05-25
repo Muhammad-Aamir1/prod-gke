@@ -1,0 +1,94 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: monitoring
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        fsGroup: 472
+      containers:
+      - name: grafana
+        image: grafana/grafana:11.0.0
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: admin
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: prom-operator
+        - name: GF_INSTALL_PLUGINS
+          value: ""
+        - name: GF_PATHS_PROVISIONING
+          value: /etc/grafana/provisioning
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 200m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: dashboards-provider
+          mountPath: /etc/grafana/provisioning/dashboards
+        - name: dashboards
+          mountPath: /var/lib/grafana/dashboards
+        - name: data
+          mountPath: /var/lib/grafana
+      volumes:
+      - name: datasources
+        configMap:
+          name: grafana-datasources
+      - name: dashboards-provider
+        configMap:
+          name: grafana-dashboards
+      - name: dashboards
+        emptyDir: {}
+      - name: data
+        persistentVolumeClaim:
+          claimName: grafana-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+  labels:
+    app: grafana
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 3000
+    name: http
+  selector:
+    app: grafana

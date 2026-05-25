@@ -1,0 +1,22 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: prod-ns
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app
+      operator: In
+      values: ["backend", "frontend"]
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8080

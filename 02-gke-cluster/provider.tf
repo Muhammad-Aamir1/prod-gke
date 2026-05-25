@@ -4,10 +4,14 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 5.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 }
 
 provider "google" {
-  project = "my-gke-project-3"
-  region  = "us-central1"
+  project = var.project_id
+  region  = var.region
 }

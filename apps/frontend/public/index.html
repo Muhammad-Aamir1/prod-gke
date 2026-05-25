@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>prod-gke App</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #f5f5f5; }
+    h1 { color: #333; }
+    .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin: 16px 0; }
+    pre { background: #f0f0f0; padding: 8px; border-radius: 4px; }
+    .status { display: inline-block; padding: 4px 12px; border-radius: 12px; font-size: 14px; }
+    .status.ok { background: #d4edda; color: #155724; }
+    .status.err { background: #f8d7da; color: #721c24; }
+  </style>
+</head>
+<body>
+  <h1>prod-gke</h1>
+  <div class="card">
+    <h2>Frontend</h2>
+    <span id="fe-status" class="status">Checking...</span>
+  </div>
+  <div class="card">
+    <h2>Backend API</h2>
+    <span id="be-status" class="status">Checking...</span>
+    <pre id="be-response"></pre>
+  </div>
+  <div class="card">
+    <h2>PostgreSQL</h2>
+    <span id="pg-status" class="status">Checking...</span>
+  </div>
+  <div class="card">
+    <h2>Redis</h2>
+    <span id="redis-status" class="status">Checking...</span>
+  </div>
+  <script>
+    async function check(){
+      document.getElementById('fe-status').textContent = 'OK'; document.getElementById('fe-status').className = 'status ok';
+      try {
+        const r = await fetch('/api/health'); const d = await r.json();
+        document.getElementById('be-status').textContent = 'OK'; document.getElementById('be-status').className = 'status ok';
+        document.getElementById('be-response').textContent = JSON.stringify(d, null, 2);
+        document.getElementById('pg-status').textContent = d.postgres || 'N/A'; document.getElementById('pg-status').className = 'status ok';
+        document.getElementById('redis-status').textContent = d.redis || 'N/A'; document.getElementById('redis-status').className = 'status ok';
+      } catch(e) {
+        document.getElementById('be-status').textContent = 'Unreachable'; document.getElementById('be-status').className = 'status err';
+        document.getElementById('be-response').textContent = e.message;
+      }
+    }
+    check();
+  </script>
+</body>
+</html>
