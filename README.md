@@ -78,23 +78,38 @@ prod-gke/
 │   ├── backend.tf             # GCS remote state backend
 │   └── cloud-armor.tf         # WAF policy (disabled by default)
 │
-├── 03-k8s-manifests/          # Kubernetes: application layer
-│   ├── namespaces.yaml        # Namespace + SA + ResourceQuota + LimitRange
-│   ├── eso-store.yaml         # External Secrets Operator SecretStore
-│   ├── network-policies/      # Defense-in-depth network policies
-│   │   ├── 01-default-deny.yaml
-│   │   ├── 02-allow-dns.yaml
-│   │   ├── 03-app-routing.yaml
-│   │   ├── 04-allow-gcp-apis.yaml
-│   │   ├── 05-allow-frontend-ingress.yaml
-│   │   └── 06-allow-monitoring-scrape.yaml
-│   └── apps/                  # Application workloads
-│       ├── 01-databases.yaml      # PostgreSQL StatefulSet + Redis Deployment
-│       ├── 02-backend.yaml        # Backend API (Express.js + prom-client)
-│       ├── 03-frontend.yaml       # Frontend web (Express.js + HPA)
-│       ├── 04-gateway.yaml        # GKE Gateway API + ManagedCertificate
-│       ├── 05-external-secrets.yaml   # ExternalSecret for DB creds
-│       └── 06-pod-disruption-budgets.yaml  # PDBs for all workloads
+├── 03-k8s-manifests/          # Kubernetes: application layer (Kustomized)
+│   ├── base/                  # Shared base resources (applied to all envs)
+│   │   ├── kustomization.yaml # Aggregates all base resources
+│   │   ├── namespaces.yaml    # Namespace + SA + ResourceQuota + LimitRange
+│   │   ├── eso-store.yaml     # External Secrets Operator SecretStore
+│   │   ├── network-policies/  # Defense-in-depth network policies
+│   │   │   ├── 01-default-deny.yaml
+│   │   │   ├── 02-allow-dns.yaml
+│   │   │   ├── 03-app-routing.yaml
+│   │   │   ├── 04-allow-gcp-apis.yaml
+│   │   │   ├── 05-allow-frontend-ingress.yaml
+│   │   │   └── 06-allow-monitoring-scrape.yaml
+│   │   └── apps/              # Application workloads
+│   │       ├── 01-databases.yaml      # PostgreSQL StatefulSet + Redis
+│   │       ├── 02-backend.yaml        # Backend API (Express.js)
+│   │       ├── 03-frontend.yaml       # Frontend web (Express.js + HPA)
+│   │       ├── 04-gateway.yaml        # GKE Gateway API + ManagedCertificate
+│   │       ├── 05-external-secrets.yaml   # ExternalSecret for DB creds
+│   │       └── 06-pod-disruption-budgets.yaml  # PDBs for all workloads
+│   └── overlays/              # Environment-specific Kustomize overlays
+│       ├── dev/               # 1 replica, small HPA range
+│       ├── staging/           # 2 replicas, medium HPA range
+│       └── prod/              # 3 replicas, prod HPA range
+│
+├── 04-argocd/                 # ArgoCD GitOps configuration
+│   ├── 00-namespace.yaml      # argocd namespace (PSA restricted)
+│   ├── kustomization.yaml     # Aggregates all ArgoCD resources
+│   └── appsets/               # ApplicationSets per environment
+│       ├── dev-appset.yaml
+│       ├── staging-appset.yaml
+│       ├── prod-appset.yaml
+│       └── monitoring-app.yaml
 │
 ├── 04-monitoring/             # Prometheus + Grafana in-cluster monitoring
 │   ├── 00-namespace-rbac.yaml     # monitoring namespace + SA + ClusterRole
@@ -178,7 +193,23 @@ make shared-vpc ENV=prod
 make cluster ENV=prod
 ```
 
-### 4. Build and Push Application Images
+### 4. Bootstrap GitOps (ArgoCD)
+
+```bash
+# Get cluster credentials + install ArgoCD + apply ApplicationSets
+# ArgoCD will auto-sync all manifests from Git
+make argocd-bootstrap ENV=prod
+
+# Get the ArgoCD UI admin password
+make argocd-password ENV=prod
+
+# Port-forward to the ArgoCD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+```
+
+> **Note:** Before bootstrapping, set your Git repo URL in `04-argocd/appsets/*.yaml` by replacing `REPLACE_WITH_YOUR_GIT_REPO_URL`.
+
+### 5. Build and Push Application Images
 
 ```bash
 # Create Artifact Registry repository
@@ -198,24 +229,29 @@ docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/frontend:late
 docker push us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/frontend:latest
 ```
 
-### 5. Deploy Applications
+### 6. Applications + Monitoring (Auto-deployed by ArgoCD)
 
+ArgoCD syncs automatically from Git. After bootstrapping, it deploys:
+- **Applications** — from `03-k8s-manifests/overlays/<env>/` via ApplicationSet
+- **Monitoring** — from `04-monitoring/` via a standalone Application
+
+Check sync status:
 ```bash
-# Get cluster credentials
-make get-credentials ENV=prod
-
-# Step 3: Deploy K8s manifests (namespace, network policies, apps)
-make manifests ENV=prod
+argocd app list
+# or
+kubectl get applicationsets -n argocd
+kubectl get applications -n argocd
 ```
 
-### 6. Deploy Monitoring Stack
+### 7. Access Grafana
 
 ```bash
-# Deploy Prometheus + Grafana
-kubectl apply -f 04-monitoring/
-
 # Get Grafana external IP
 kubectl get svc grafana -n monitoring -w
+
+# Or port-forward
+kubectl port-forward svc/grafana -n monitoring 8080:80
+# Visit http://localhost:8080, login: admin / prom-operator
 ```
 
 ### 7. Set Up DNS (Optional)
@@ -378,15 +414,17 @@ Each environment uses its own GCS state prefix: `dev/01-shared-vpc`, `staging/01
 The layers must be deployed in order:
 
 ```
-01-shared-vpc  →  02-gke-cluster  →  03-k8s-manifests  →  04-monitoring
-  (network)        (cluster)          (apps)               (monitoring)
+01-shared-vpc  →  02-gke-cluster  →  04-argocd (bootstrap)  →  ArgoCD auto-syncs apps + monitoring
+  (network)        (cluster)          (GitOps)                      (Git → Cluster)
 ```
 
 And destroyed in reverse:
 
 ```
-04-monitoring  →  03-k8s-manifests  →  02-gke-cluster  →  01-shared-vpc
+ArgoCD apps  →  ArgoCD itself  →  02-gke-cluster  →  01-shared-vpc
 ```
+
+> **Note:** After `argocd-bootstrap`, ArgoCD manages `03-k8s-manifests/` and `04-monitoring/` automatically. No manual `kubectl apply` needed.
 
 ## Terraform State
 
@@ -402,6 +440,85 @@ terraform init -backend-config="bucket=<PROJECT_ID>-tfstate" -backend-config="pr
 ```
 
 The `prefix` should match the environment + module name. Backend config is passed at init time so the same Terraform code works across environments.
+
+## GitOps with ArgoCD
+
+The project uses **ArgoCD** as its GitOps operator. After bootstrapping, ArgoCD continuously reconciles the cluster state with the Git repository — any PR merged to `main` is automatically synced.
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      Git Repository                          │
+│  ┌─────────────────┐  ┌────────────────┐  ┌──────────────┐  │
+│  │ 03-k8s-manifests│  │ 04-monitoring  │  │ 04-argocd    │  │
+│  │ overlays/<env>/ │  │ Prometheus/    │  │ Application  │  │
+│  │ Kustomize       │  │ Grafana YAML   │  │ Sets + Apps  │  │
+│  └────────┬────────┘  └───────┬────────┘  └──────┬───────┘  │
+└───────────┼──────────────────┼───────────────────┼──────────┘
+            │                  │                   │
+            ▼                  ▼                   ▼
+    ┌───────────────────────────────────────────────────────┐
+    │                  ArgoCD (argocd ns)                    │
+    │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  │
+    │  │ AppSet: dev  │  │ AppSet: prod │  │ App:        │  │
+    │  │ → dev overlay│  │ → prod       │  │ monitoring  │  │
+    │  │              │  │   overlay    │  │ → 04-       │  │
+    │  │              │  │              │  │   monitoring│  │
+    │  └──────────────┘  └──────────────┘  └─────────────┘  │
+    └──────────────────────────┬────────────────────────────┘
+                               │
+                               ▼
+                    ┌──────────────────┐
+                    │   GKE Cluster    │
+                    │ ┌──────────────┐ │
+                    │ │ prod-ns      │ │
+                    │ │ apps + DBs   │ │
+                    │ └──────────────┘ │
+                    │ ┌──────────────┐ │
+                    │ │ monitoring   │ │
+                    │ │ Prom/Grafana │ │
+                    │ └──────────────┘ │
+                    └──────────────────┘
+```
+
+### Sync Waves (Deployment Order)
+
+ArgoCD respects sync-wave annotations to deploy resources in the correct order:
+
+| Wave | Resources | Rationale |
+|------|-----------|-----------|
+| `-1` | Namespace (prod-ns) | Must exist before anything else |
+| `0` | SecretStore, NetworkPolicies | Dependencies for apps |
+| `1` | PostgreSQL, Redis | Backend depends on these |
+| `2` | Backend API | Needs DBs to be ready |
+| `3` | Frontend Web + HPA | Needs Backend |
+| `4` | Gateway + Certificates | Needs Frontend Service |
+| `5` | PodDisruptionBudgets | Final safety layer |
+
+### Workflow
+
+```bash
+# 1. Make changes to manifests
+vim 03-k8s-manifests/overlays/prod/kustomization.yaml
+
+# 2. Commit and push to Git
+git add . && git commit -m "feat: bump frontend replicas"
+git push origin main
+
+# 3. ArgoCD auto-syncs (within 3 minutes by default)
+#    Or trigger manually:
+argocd app sync prod-gke-prod
+```
+
+### Accessing ArgoCD UI
+
+```bash
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+# Visit https://localhost:8080
+# Username: admin
+# Password: run `make argocd-password ENV=prod`
+```
 
 ## Node Pool Design
 
@@ -518,7 +635,7 @@ Disabled by default. Provides a configurable Cloud Armor WAF security policy wit
 ## Useful Commands
 
 ```bash
-# Deploy everything
+# Deploy everything (infra + ArgoCD)
 make all ENV=prod
 
 # Plan changes
@@ -528,16 +645,23 @@ make plan-cluster ENV=prod
 # Get cluster credentials
 make get-credentials ENV=prod
 
-# Destroy everything
+# ArgoCD / GitOps
+make argocd-bootstrap ENV=prod  # Install ArgoCD + apply ApplicationSets
+make argocd-password ENV=prod   # Get admin password
+make argocd-sync ENV=prod       # Manually sync env
+
+# Destroy everything (reverse order)
 make destroy ENV=prod
 
-# Tear down specific layers manually
-kubectl delete -f 04-monitoring/
-make destroy-manifests ENV=prod
+# Tear down specific layers
+make destroy-argocd ENV=prod
 make destroy-cluster ENV=prod
 make destroy-shared-vpc ENV=prod
 
 # Port-forward to access services
 kubectl port-forward svc/frontend-svc -n prod-ns 8080:80
 kubectl port-forward svc/grafana -n monitoring 8080:80
+
+# ArgoCD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443
 ```

@@ -4,6 +4,8 @@ kind: Service
 metadata:
   name: postgres-svc
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   clusterIP: None
   selector:
@@ -16,6 +18,8 @@ kind: StatefulSet
 metadata:
   name: postgres
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   serviceName: "postgres-svc"
   replicas: 1
@@ -98,6 +102,8 @@ kind: Deployment
 metadata:
   name: redis
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   replicas: 1
   selector:
@@ -157,6 +163,8 @@ kind: Service
 metadata:
   name: redis-svc
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   selector:
     app: redis

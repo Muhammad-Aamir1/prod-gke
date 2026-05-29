@@ -1,0 +1,40 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: prod-gke-prod
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - cluster: prod
+            url: https://kubernetes.default.svc
+  template:
+    metadata:
+      name: prod-gke-prod
+      labels:
+        environment: prod
+        app.kubernetes.io/managed-by: argocd
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/Muhammad-Aamir1/prod-gke.git
+        targetRevision: main
+        path: 03-k8s-manifests/overlays/prod
+      destination:
+        server: "{{url}}"
+        namespace: prod-ns
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      revisionHistoryLimit: 5

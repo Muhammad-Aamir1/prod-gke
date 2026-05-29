@@ -1,0 +1,21 @@
+# Decisions & Challenges
+
+## Decisions
+
+| # | Area | Decision | Rationale |
+|---|------|----------|-----------|
+| 1 | ArgoCD | Install via upstream manifest URL in bootstrap, not committed YAML | Keeps repo small; ArgoCD team manages the install YAML; we manage only the config |
+| 2 | Kustomize | Use `base/` + `overlays/<env>/` pattern instead of Helm | Project already uses raw YAML; Kustomize is a lighter lift and needs no Chart.yaml/values.yaml rewrite; overlays give us env-specific patches without touching base |
+| 3 | Kustomize | Keep `monitoring` as a separate ArgoCD Application, not part of app overlays | Monitoring deploys to a different namespace (`monitoring`) with different RBAC and lifecycle; separates concerns cleanly |
+| 4 | Sync waves | Annotate each YAML resource directly with `argocd.argoproj.io/sync-wave` instead of using Kustomize commonAnnotations | commonAnnotations applies the same wave to everything; per-resource annotation is more precise and avoids patching complexity |
+| 5 | Application model | One ApplicationSet per environment (dev/staging/prod) + one standalone Application for monitoring | ApplicationSet with git directory generator auto-discovers overlays; monitoring is a fixed path |
+| 6 | Git repos | Single monorepo for both app source + K8s manifests + ArgoCD config | Matches existing project structure; avoids cross-repo complexity for a reference architecture |
+| 7 | Deployment order | Terraform (VPC → Cluster) → bootstrap ArgoCD → ArgoCD syncs apps + monitoring | ArgoCD goes after cluster exists; apps and monitoring depend on cluster being ready |
+
+## Challenges
+
+| # | Challenge | Solution |
+|---|-----------|----------|
+| 1 | Kustomize patches require knowing exact JSON paths for each resource | Used `target` (kind + name) to scope patches; tested patches against base resources |
+| 2 | Sync waves for network policies vs apps — namespaces must exist first | Applied `argocd.argoproj.io/sync-wave: "-1"` on namespace, `"0"` on network policies + SecretStore, `"1"` on DBs, `"2"` on backend, `"3"` on frontend, `"4"` on gateway, `"5"` on PDBs |
+| 3 | Destroy order with ArgoCD — ArgoCD manages apps, so destroying via `kubectl delete` would conflict | Updated `destroy-manifests` to delete ArgoCD Applications first (which prunes all managed resources), then delete namespaces |

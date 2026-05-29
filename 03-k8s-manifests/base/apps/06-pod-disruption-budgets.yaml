@@ -4,6 +4,8 @@ kind: PodDisruptionBudget
 metadata:
   name: frontend-pdb
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
 spec:
   minAvailable: 1
   selector:
@@ -15,6 +17,8 @@ kind: PodDisruptionBudget
 metadata:
   name: backend-pdb
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
 spec:
   minAvailable: 1
   selector:
@@ -26,6 +30,8 @@ kind: PodDisruptionBudget
 metadata:
   name: postgres-pdb
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
 spec:
   minAvailable: 1
   selector:
@@ -37,6 +43,8 @@ kind: PodDisruptionBudget
 metadata:
   name: redis-pdb
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
 spec:
   minAvailable: 1
   selector:

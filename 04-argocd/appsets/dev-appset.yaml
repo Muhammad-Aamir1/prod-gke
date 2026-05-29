@@ -1,0 +1,119 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: prod-gke-dev
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - cluster: dev
+            url: https://kubernetes.default.svc
+  template:
+    metadata:
+      name: prod-gke-dev
+      labels:
+        environment: dev
+        app.kubernetes.io/managed-by: argocd
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/Muhammad-Aamir1/prod-gke.git
+        targetRevision: main
+        path: 03-k8s-manifests/overlays/dev
+      destination:
+        server: "{{url}}"
+        namespace: prod-ns
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - PruneLast=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 5s
+            factor: 2
+            maxDuration: 3m
+      revisionHistoryLimit: 5
+
+# Line-by-Line Breakdown
+# 1. The Metadata
+# YAML
+# apiVersion: argoproj.io/v1alpha1
+# kind: ApplicationSet
+# metadata:
+#   name: prod-gke-dev
+#   namespace: argocd
+# kind: ApplicationSet: Tells ArgoCD to treat this as a controller that generates applications.
+
+# namespace: argocd: This is where your ArgoCD controller lives and listens for instructions.
+
+# 2. The Generator (The "Where")
+# YAML
+# spec:
+#   generators:
+#     - list:
+#         elements:
+#           - cluster: dev
+#             url: https://kubernetes.default.svc
+# Here's the thing: even though this list only has one element right now, you can add 10 more clusters here later.
+
+# ArgoCD reads this list and replaces placeholders in your template. It creates a key-value pair for {{cluster}} and {{url}}.
+
+# https://kubernetes.default.svc points to the internal cluster where ArgoCD itself is currently running.
+
+# 3. The Source (The "What")
+# YAML
+#   template:
+#     spec:
+#       project: default
+#       source:
+#         repoURL: https://github.com/Muhammad-Aamir1/prod-gke.git
+#         targetRevision: main
+#         path: 03-k8s-manifests/overlays/dev
+# repoURL: The GitHub repository containing your Kubernetes code.
+
+# targetRevision: main: ArgoCD tracks the main branch.
+
+# path: It looks specifically inside the 03-k8s-manifests/overlays/dev folder (likely a Kustomize overlay for development).
+
+# 4. The Destination (The "Target")
+# YAML
+#       destination:
+#         server: "{{url}}"
+#         namespace: prod-ns
+# server: "{{url}}": This is where the magic happens. The generator passes https://kubernetes.default.svc right into this placeholder.
+
+# namespace: prod-ns: The application will deploy its resources into a Kubernetes namespace named prod-ns.
+
+# 5. Automation & Self-Healing (The "Guardrails")
+# YAML
+#       syncPolicy:
+#         automated:
+#           prune: true
+#           selfHeal: true
+# prune: true: If you delete a file from Git, ArgoCD automatically deletes it from your Kubernetes cluster. No leftover garbage.
+
+# selfHeal: true: If someone manually changes a setting inside the cluster using kubectl, ArgoCD catches it and immediately overwrites it back to match Git. Git is the absolute source of truth.
+
+# YAML
+#         syncOptions:
+#           - CreateNamespace=true
+#           - PruneLast=true
+# CreateNamespace=true: If prod-ns does not exist on your cluster yet, ArgoCD will create it for you.
+
+# PruneLast=true: Deletes old resources at the very end of the deployment process rather than the beginning.
+
+# YAML
+#         retry:
+#           limit: 5
+#           backoff:
+#             duration: 5s
+#             factor: 2
+#             maxDuration: 3m
+# If the deployment fails (e.g., the cluster is temporarily unreachable), ArgoCD will try up to 5 times.
+
+# It waits 5 seconds, then doubles the wait time (factor: 2) each time (5s, 10s, 20s...), capping the wait at 3 minutes.

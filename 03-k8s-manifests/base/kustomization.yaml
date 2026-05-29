@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespaces.yaml
+  - eso-store.yaml
+  - network-policies/01-default-deny.yaml
+  - network-policies/02-allow-dns.yaml
+  - network-policies/03-app-routing.yaml
+  - network-policies/04-allow-gcp-apis.yaml
+  - network-policies/05-allow-frontend-ingress.yaml
+  - network-policies/06-allow-monitoring-scrape.yaml
+  - apps/01-databases.yaml
+  - apps/02-backend.yaml
+  - apps/03-frontend.yaml
+  - apps/04-gateway.yaml
+  - apps/05-external-secrets.yaml
+  - apps/06-pod-disruption-budgets.yaml

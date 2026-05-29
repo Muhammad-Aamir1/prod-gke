@@ -4,6 +4,8 @@ kind: Deployment
 metadata:
   name: frontend-web
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
 spec:
   replicas: 1
   selector:
@@ -76,6 +78,8 @@ kind: Service
 metadata:
   name: frontend-svc
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
 spec:
   type: LoadBalancer
   selector:
@@ -89,6 +93,8 @@ kind: HorizontalPodAutoscaler
 metadata:
   name: frontend-hpa
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

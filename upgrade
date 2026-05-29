@@ -1,0 +1,87 @@
+# prod-gke — Upgrade Roadmap
+# Suggestions to make this project stand out from the crowd
+
+---
+
+## 1. GitOps (ArgoCD)
+Replace `kubectl apply` in Makefile with ArgoCD ApplicationSets.
+- Auditable, self-healing, declarative deployments
+- One ApplicationSet per environment (dev/staging/prod)
+- Auto-sync with PR-driven Git workflow
+
+## 2. Kyverno Policies
+Write 5-7 custom cluster policies beyond PSA `restricted`:
+- Block `latest` image tag
+- Require resource requests/limits on all containers
+- Forbid `hostNetwork` / `hostPID`
+- Require readiness + liveness probes
+- Enforce label presence (`app`, `tier`, `env`)
+
+## 3. Load Testing + SLO Dashboards
+Add `tests/` directory with:
+- **k6** scripts simulating realistic traffic patterns
+- **Grafana SLO dashboards**: p99 latency ≤ 500ms, error rate < 1%
+- Proves the architecture works under load
+
+## 4. Kustomize Overlays
+Replace raw YAML with Kustomize structure:
+```
+03-k8s-manifests/
+├── base/                    # Shared manifests
+└── overlays/
+    ├── dev/                 # 1 replica, small resources
+    ├── staging/             # 2 replicas, medium resources
+    └── prod/                # 3+ replicas, production resources
+```
+Each overlay patches replicas, resources, and image tags per env.
+
+## 5. Velero Backup / DR
+Add Velero backup manifests for:
+- PVCs (Postgres 10Gi, Prometheus 10Gi, Grafana 5Gi)
+- Cluster resources (namespaces, deployments, secrets)
+- Scheduled backups + restore procedure docs
+
+## 6. Terraform Compliance Scanning
+Add `checkov` or `tfsec` to CI pipeline:
+- Catch security misconfigs before `terraform apply`
+- Enforce guardrails like "no public exposure", "encryption enabled"
+
+## 7. Chaos Engineering (ChaosMesh)
+Per `more.txt` — add ChaosMesh experiments:
+- **Pod kill**: Kill frontend pods → verify HPA + PDB recovery
+- **Network latency**: Add delay between backend ↔ Postgres
+- **CPU stress**: Saturate spot pool nodes → verify autoscaling
+Each experiment includes a "probe" that asserts SLOs are maintained.
+
+## 8. Pre-commit Hooks
+Add `.pre-commit-config.yaml`:
+- `tflint` — Terraform linting
+- `terraform fmt` — formatting check
+- `trivy` — container + IaC vulnerability scanning
+- `checkov` — Terraform security compliance
+
+## 9. Container Signing (cosign)
+- Sign all container images in CI using cosign + keyless (OIDC)
+- Add Kyvernorule to verify signatures before admitting pods
+- Ensures supply chain integrity
+
+## 10. Kubecost / OpenCost
+Add manifests for OpenCost or Kubecost:
+- Pre-built dashboards for cost allocation by namespace / label
+- Alerts on cost anomalies
+- Strengthens the existing FinOps angle
+
+## 11. Terraform State Locking + CI
+Add GitHub Actions (or equivalent) workflow:
+```
+on: push → tflint → checkov → terraform plan → (manual) → apply
+```
+- Remote state locking via GCS with `terraform init`
+- Plan output posted as PR comment
+- Apply only from `main` branch
+
+## 12. Secret Rotation Automation
+Extend the `modules/secrets` to include:
+- Automatic rotation schedule for Postgres passwords
+- Secret Manager rotation triggers
+- External Secrets Operator picks up rotated secrets without restart

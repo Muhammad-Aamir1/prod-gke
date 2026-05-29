@@ -4,6 +4,8 @@ kind: Deployment
 metadata:
   name: backend-api
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   replicas: 1
   selector:
@@ -79,6 +81,8 @@ kind: Service
 metadata:
   name: backend-svc
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   selector:
     app: backend

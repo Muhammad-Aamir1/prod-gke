@@ -4,6 +4,8 @@ kind: ManagedCertificate
 metadata:
   name: prod-cert
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
 spec:
   domains:
     - REPLACE_WITH_YOUR_DOMAIN.com
@@ -14,6 +16,7 @@ metadata:
   name: external-http-gw
   namespace: prod-ns
   annotations:
+    argocd.argoproj.io/sync-wave: "4"
     networking.gke.io/managed-certificates: "prod-cert"
 spec:
   gatewayClassName: gke-l7-gxlb
@@ -38,6 +41,8 @@ kind: HTTPRoute
 metadata:
   name: http-to-https-redirect
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
 spec:
   parentRefs:
   - name: external-http-gw
@@ -54,6 +59,8 @@ kind: HTTPRoute
 metadata:
   name: frontend-route
   namespace: prod-ns
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
 spec:
   parentRefs:
   - name: external-http-gw
