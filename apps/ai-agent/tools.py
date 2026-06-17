@@ -136,9 +136,12 @@ async def restart_deployment(name: str, namespace: str) -> str:
 
 def get_tool_defs():
     return [{
-        "name": t["name"],
-        "description": t["description"],
-        "parameters": t["parameters"]
+        "type": "function",
+        "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["parameters"]
+        }
     } for t in TOOLS]
 
 async def call_tool(name: str, args: dict) -> str:

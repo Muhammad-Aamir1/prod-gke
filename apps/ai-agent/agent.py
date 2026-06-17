@@ -1,8 +1,9 @@
-import os, json, httpx
+import os, json, asyncio, httpx
 from tools import get_tool_defs, call_tool
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o")
+OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "2000"))
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:8080")
 SITE_NAME = "prod-gke AI Agent"
 
@@ -63,12 +64,15 @@ class Agent:
         system_msg = {"role": "system", "content": SYSTEM_PROMPT}
         all_messages = [system_msg] + messages
 
-        response_text, tool_calls = await self._llm_call(all_messages)
+        response_text, tool_calls, assistant_msg = await self._llm_call(all_messages)
 
         if tool_calls:
+            all_messages.append(assistant_msg)
+
             extra = {"tool_calls": []}
             for tc in tool_calls:
                 name = tc.get("name")
+                call_id = tc.get("id", name)
                 args = tc.get("arguments", {})
                 result = await call_tool(name, args)
                 extra["tool_calls"].append({
@@ -78,11 +82,11 @@ class Agent:
                 })
                 all_messages.append({
                     "role": "tool",
-                    "tool_call_id": name,
+                    "tool_call_id": call_id,
                     "content": result[:3000] if len(result) > 3000 else result
                 })
 
-            final_text, _ = await self._llm_call(all_messages)
+            final_text, _, _ = await self._llm_call(all_messages)
             return {
                 "response": final_text,
                 "messages": messages + [{"role": "assistant", "content": final_text}],
@@ -91,13 +95,13 @@ class Agent:
 
         return {
             "response": response_text,
-            "messages": messages + [{"role": "assistant", "content": response_text}],
+            "messages": messages + [assistant_msg] if assistant_msg else messages + [{"role": "assistant", "content": response_text}],
             "extra": {}
         }
 
     async def _llm_call(self, messages: list) -> tuple:
         if not OPENROUTER_API_KEY:
-            return "Error: OPENROUTER_API_KEY environment variable not set. Please set it and restart the agent.", []
+            return "Error: OPENROUTER_API_KEY environment variable not set. Please set it and restart the agent.", [], {}
 
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -111,23 +115,36 @@ class Agent:
             "messages": messages,
             "tools": self.tool_defs,
             "tool_choice": "auto",
-            "max_tokens": 4096,
+            "max_tokens": OPENROUTER_MAX_TOKENS,
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                r = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-                data = r.json()
-        except Exception as e:
-            return f"Error calling OpenRouter: {e}", []
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=90) as client:
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                    data = resp.json()
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return f"Error calling OpenRouter: {e}", [], {}
 
-        if "error" in data:
-            err = data["error"]
-            return f"OpenRouter error: {err.get('message', str(err))}", []
+            if "error" in data:
+                err = data["error"]
+                code = err.get("code", 0)
+                if code == 429 and attempt < 2:
+                    retry_after = err.get("metadata", {}).get("retry_after_seconds", 5)
+                    await asyncio.sleep(retry_after + 1)
+                    continue
+                import logging
+                logging.error(f"OpenRouter error: status={resp.status_code}, detail={json.dumps(err)[:500]}, request_messages={len(messages)}")
+                return f"OpenRouter error ({resp.status_code}): {err.get('message', str(err))}", [], {}
+
+            break
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
@@ -143,8 +160,9 @@ class Agent:
             except json.JSONDecodeError:
                 args = {"raw_args": args_raw}
             tool_calls.append({
+                "id": tc.get("id", ""),
                 "name": fn.get("name", "unknown"),
                 "arguments": args,
             })
 
-        return content, tool_calls
+        return content, tool_calls, msg
