@@ -1,5 +1,5 @@
 import os, json, asyncio, httpx, logging
-from tools import get_tool_defs, call_tool
+from tools import get_tool_defs, call_tool, set_role, get_role
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
@@ -8,7 +8,15 @@ SITE_URL = os.environ.get("SITE_URL", "http://localhost:8080")
 SITE_NAME = "prod-gke AI Agent"
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
-SYSTEM_PROMPT = """You are a DevOps AI agent managing a production GKE cluster called prod-gke. You have full access to kubectl, helm, gcloud, and can make HTTP requests.
+def make_system_prompt(role: str = "admin") -> str:
+    return f"""You are a DevOps AI agent managing a production GKE cluster called prod-gke. You have full access to kubectl, helm, gcloud, and can make HTTP requests.
+
+## Current Role: {role}
+Your kubectl commands run with the role selected by the user. Respect your role's limitations:
+- viewer: read-only access to cluster resources (can view but not create/update/delete)
+- edit: can modify resources but not RBAC
+- admin: full cluster-admin access
+If a command fails due to permissions, inform the user and suggest a higher role.
 
 ## Cluster Overview
 - **Cluster**: dev-cluster in us-central1, GKE 1.35.5, Dataplane V2
@@ -59,8 +67,9 @@ class Agent:
     def __init__(self):
         self.tool_defs = get_tool_defs()
 
-    async def run(self, messages: list) -> dict:
-        system_msg = {"role": "system", "content": SYSTEM_PROMPT}
+    async def run(self, messages: list, role: str = "admin") -> dict:
+        set_role(role)
+        system_msg = {"role": "system", "content": make_system_prompt(role)}
         all_messages = [system_msg] + messages
 
         response_text, tool_calls, assistant_msg = await self._llm_call(all_messages)
@@ -70,6 +79,7 @@ class Agent:
 
             extra = {"tool_calls": []}
             for tc in tool_calls:
+                set_role(role)
                 name = tc.get("name")
                 call_id = tc.get("id", name)
                 args = tc.get("arguments", {})
@@ -86,15 +96,17 @@ class Agent:
                 })
 
             final_text, _, _ = await self._llm_call(all_messages, allow_tools=False)
+            text = final_text or "Command executed. Check the tool results above for details."
             return {
-                "response": final_text,
-                "messages": messages + [{"role": "assistant", "content": final_text}],
+                "response": text,
+                "messages": messages + [{"role": "assistant", "content": text}],
                 "extra": extra
             }
 
+        text = response_text or "No response from agent."
         return {
-            "response": response_text,
-            "messages": messages + [assistant_msg] if assistant_msg else messages + [{"role": "assistant", "content": response_text}],
+            "response": text,
+            "messages": messages + [{"role": "assistant", "content": text}],
             "extra": {}
         }
 

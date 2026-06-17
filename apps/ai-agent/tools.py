@@ -1,8 +1,47 @@
-import subprocess, json, os, asyncio, httpx, shlex, logging
+import subprocess, json, os, asyncio, httpx, shlex, logging, base64, contextvars
 from typing import Any
 from urllib.parse import quote
 
 TOOLS = []
+
+ROLE_TOKENS = {}
+_current_role: contextvars.ContextVar[str] = contextvars.ContextVar("current_role", default="admin")
+
+def load_role_tokens():
+    ns = "ai-agent"
+    try:
+        ns = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r").read().strip()
+    except:
+        pass
+    for role in ["viewer", "edit", "admin"]:
+        secret_name = f"agent-{role}-token"
+        try:
+            tok_raw = subprocess.run(
+                ["kubectl", "get", "secret", secret_name, "-n", ns, "-o", "jsonpath={.data.token}"],
+                capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+            if tok_raw:
+                ROLE_TOKENS[role] = base64.b64decode(tok_raw).decode()
+                logging.info(f"Loaded token for role '{role}' ({len(tok_raw)} chars)")
+        except Exception as e:
+            logging.warning(f"Failed to load token for role '{role}': {e}")
+
+def set_role(role: str):
+    _current_role.set(role)
+
+def get_role():
+    return _current_role.get()
+
+def _kubectl(cmd: str, timeout=30) -> str:
+    role = get_role()
+    token = ROLE_TOKENS.get(role, "")
+    if token:
+        full_cmd = f"kubectl --token={shlex.quote(token)} {cmd}"
+    else:
+        full_cmd = f"kubectl {cmd}"
+    return _run(full_cmd, timeout)
+
+load_role_tokens()
 
 def tool(name, desc, params):
     def dec(fn):
@@ -37,7 +76,7 @@ def _validate_shell_safe(val: str, name: str) -> str:
 })
 async def run_kubectl(command: str) -> str:
     _validate_shell_safe(command, "command")
-    return _run(f"kubectl {command}", timeout=30)
+    return _kubectl(command, timeout=30)
 
 @tool("run_helm", "Run any helm command", {
     "type": "object", "properties": {
@@ -61,10 +100,10 @@ async def run_gcloud(command: str) -> str:
     "type": "object", "properties": {}
 })
 async def cluster_health(**kw) -> str:
-    pods = _run("kubectl get pods -A --no-headers 2>&1 | awk '{print $2, $3}' | sort | uniq -c | sort -rn", timeout=15)
-    nodes = _run("kubectl get nodes --no-headers -o wide", timeout=10)
-    services = _run("kubectl get svc -A --no-headers | grep -E 'LoadBalancer|NodePort' | awk '{print $2, $4, $5}'", timeout=10)
-    pvcs = _run("kubectl get pvc -A --no-headers", timeout=10)
+    pods = _kubectl("get pods -A --no-headers 2>&1 | awk '{print $2, $3}' | sort | uniq -c | sort -rn", timeout=15)
+    nodes = _kubectl("get nodes --no-headers -o wide", timeout=10)
+    services = _kubectl("get svc -A --no-headers | grep -E 'LoadBalancer|NodePort' | awk '{print $2, $4, $5}'", timeout=10)
+    pvcs = _kubectl("get pvc -A --no-headers", timeout=10)
     return f"=== Pods ===\n{pods}\n\n=== Nodes ===\n{nodes}\n\n=== LoadBalancer Services ===\n{services}\n\n=== PVCs ===\n{pvcs}"
 
 @tool("make_request", "Make HTTP request to a service URL", {
@@ -88,7 +127,7 @@ async def make_request(url: str, method: str = "GET") -> str:
 })
 async def deploy_kustomize(path: str) -> str:
     _validate_shell_safe(path, "path")
-    return _run(f"kubectl apply -k {path}", timeout=60)
+    return _kubectl(f"apply -k {path}", timeout=60)
 
 @tool("deploy_helm", "Deploy or upgrade a Helm chart from a directory", {
     "type": "object", "properties": {
@@ -115,7 +154,7 @@ async def deploy_helm(name: str, path: str, namespace: str, values: str = "") ->
 })
 async def query_prometheus(query: str) -> str:
     encoded = quote(query, safe='')
-    result = _run(f'kubectl exec -n monitoring deployment/monitoring-kube-prometheus-prometheus -- wget -qO- "http://localhost:9090/api/v1/query?query={encoded}"', timeout=15)
+    result = _kubectl(f'exec -n monitoring deployment/monitoring-kube-prometheus-prometheus -- wget -qO- "http://localhost:9090/api/v1/query?query={encoded}"', timeout=15)
     try:
         data = json.loads(result)
         results = data.get("data", {}).get("result", [])
@@ -141,7 +180,7 @@ async def query_prometheus(query: str) -> str:
 async def read_logs(label: str, namespace: str = "prod-ns", tail: int = 20) -> str:
     _validate_shell_safe(label, "label")
     _validate_shell_safe(namespace, "namespace")
-    return _run(f"kubectl logs -n {shlex.quote(namespace)} -l {shlex.quote(label)} --tail={tail}", timeout=15)
+    return _kubectl(f"logs -n {shlex.quote(namespace)} -l {shlex.quote(label)} --tail={tail}", timeout=15)
 
 @tool("restart_deployment", "Restart pods in a deployment", {
     "type": "object", "properties": {
@@ -152,7 +191,7 @@ async def read_logs(label: str, namespace: str = "prod-ns", tail: int = 20) -> s
 async def restart_deployment(name: str, namespace: str) -> str:
     _validate_shell_safe(name, "name")
     _validate_shell_safe(namespace, "namespace")
-    return _run(f"kubectl rollout restart deployment/{shlex.quote(name)} -n {shlex.quote(namespace)}", timeout=30)
+    return _kubectl(f"rollout restart deployment/{shlex.quote(name)} -n {shlex.quote(namespace)}", timeout=30)
 
 def get_tool_defs():
     return [{

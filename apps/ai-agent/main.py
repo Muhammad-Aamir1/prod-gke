@@ -48,12 +48,28 @@ HTML = """<!DOCTYPE html>
   @keyframes spin { to { transform:rotate(360deg); } }
   pre { background:#0d1117; border-radius:4px; padding:8px; overflow-x:auto; font-size:12px; margin:4px 0; }
   code { font-family:'SF Mono','Consolas',monospace; }
+  .role-select { display:flex; align-items:center; gap:6px; font-size:12px; }
+  .role-select select { background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:4px; padding:3px 6px; font-size:12px; cursor:pointer; outline:none; }
+  .role-select select:focus { border-color:#1f6feb; }
+  .role-badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:600; text-transform:uppercase; }
+  .role-badge.viewer { background:#0d419d; color:#58a6ff; }
+  .role-badge.edit { background:#096b3e; color:#3fb950; }
+  .role-badge.admin { background:#a13026; color:#f85149; }
 </style>
 </head>
 <body>
 <div class="header">
   <h1>prod-gke AI Agent</h1>
   <span>OpenRouter</span>
+  <div class="role-select">
+    <label>Role:</label>
+    <select id="roleSelect">
+      <option value="viewer">Viewer</option>
+      <option value="edit">Edit</option>
+      <option value="admin" selected>Admin</option>
+    </select>
+    <span class="role-badge admin" id="roleBadge">admin</span>
+  </div>
   <div class="status">
     <div class="status-dot"></div>
     <span>Cluster Connected</span>
@@ -70,9 +86,26 @@ HTML = """<!DOCTYPE html>
   const input = document.getElementById('input');
   const loading = document.getElementById('loading');
   const sendBtn = document.getElementById('sendBtn');
+  const roleSelect = document.getElementById('roleSelect');
+  const roleBadge = document.getElementById('roleBadge');
   function genId() { try { return crypto.randomUUID(); } catch(e) { return Date.now().toString(36) + Math.random().toString(36).slice(2); } }
   let sessionId = localStorage.getItem('sessionId') || genId();
   localStorage.setItem('sessionId', sessionId);
+  let currentRole = localStorage.getItem('agentRole') || 'admin';
+  roleSelect.value = currentRole;
+  updateRoleBadge(currentRole);
+
+  function updateRoleBadge(role) {
+    roleBadge.textContent = role;
+    roleBadge.className = 'role-badge ' + role;
+  }
+
+  roleSelect.addEventListener('change', function() {
+    currentRole = this.value;
+    localStorage.setItem('agentRole', currentRole);
+    updateRoleBadge(currentRole);
+    addMsg('bot', '[Switched to ' + currentRole + ' role]');
+  });
 
   function addMsg(type, content, extra) {
     const div = document.createElement('div');
@@ -109,7 +142,7 @@ HTML = """<!DOCTYPE html>
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({session_id: sessionId, message: msg})
+        body: JSON.stringify({session_id: sessionId, message: msg, role: currentRole})
       });
       const data = await res.json();
       if (data.error) { addMsg('bot error', data.error); return; }
@@ -151,22 +184,27 @@ async def chat(req: Request):
     if not msg.strip():
         return JSONResponse(status_code=400, content={"error": "Message is empty"})
     session_id = body.get("session_id", "default")
+    role = body.get("role", "admin")
+
+    if role not in ("viewer", "edit", "admin"):
+        role = "admin"
 
     if len(sessions) >= MAX_SESSIONS:
         oldest = min(sessions.keys(), key=lambda k: len(sessions[k]))
         del sessions[oldest]
 
     if session_id not in sessions:
-        sessions[session_id] = []
-    sessions[session_id].append({"role": "user", "content": msg.strip()})
+        sessions[session_id] = {"messages": [], "role": role}
+    sessions[session_id]["role"] = role
+    sessions[session_id]["messages"].append({"role": "user", "content": msg.strip()})
 
-    if len(sessions[session_id]) > MAX_HISTORY * 2:
-        sessions[session_id] = sessions[session_id][-MAX_HISTORY:]
+    if len(sessions[session_id]["messages"]) > MAX_HISTORY * 2:
+        sessions[session_id]["messages"] = sessions[session_id]["messages"][-MAX_HISTORY:]
 
     try:
-        result = await agent.run(sessions[session_id])
-        sessions[session_id] = result["messages"]
-        return {"response": result["response"], "extra": result.get("extra", {})}
+        result = await agent.run(sessions[session_id]["messages"], role=role)
+        sessions[session_id]["messages"] = result["messages"]
+        return {"response": result["response"], "extra": result.get("extra", {}), "role": role}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
