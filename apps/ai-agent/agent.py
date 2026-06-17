@@ -1,11 +1,12 @@
-import os, json, asyncio, httpx
+import os, json, asyncio, httpx, logging
 from tools import get_tool_defs, call_tool
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
 OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "2000"))
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:8080")
 SITE_NAME = "prod-gke AI Agent"
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 SYSTEM_PROMPT = """You are a DevOps AI agent managing a production GKE cluster called prod-gke. You have full access to kubectl, helm, gcloud, and can make HTTP requests.
 
@@ -44,16 +45,14 @@ You have these tools available. Use them to fulfill user requests:
 - Keep responses concise but informative
 - Always confirm before making destructive changes
 - When the user asks about monitoring, check Prometheus and Grafana
-
-You must respond in this format:
-1. First, reason about what tools you need to call (if any)
-2. Call the tools one at a time
-3. Give the user a clear summary of results
-
-When calling tools, you must respond with a JSON block containing a "tool_calls" array. After executing all tool calls, respond with a normal message.
-
-CRITICAL: Always respond in this format - either a plain text message OR a JSON with tool_calls:
-{"tool_calls": [{"name": "tool_name", "arguments": {"arg1": "val1"}}]}
+- Call tools using the function calling API (the system will handle tool execution)
+- After calling tools, summarize the results for the user in plain text
+- You can call multiple tools in parallel if they are independent
+- Always respond in plain text with no markdown formatting (no **bold**, no *italic*, no ```code blocks```, no bullet lists with - or *)
+- Use simple plain text:
+  - Use simple lines like: Pods: all running (5/5)
+  - Use simple lines like: Services: frontend LoadBalancer at 34.171.99.210
+  - Use simple lines like: Status: healthy
 """
 
 class Agent:
@@ -86,7 +85,7 @@ class Agent:
                     "content": result[:3000] if len(result) > 3000 else result
                 })
 
-            final_text, _, _ = await self._llm_call(all_messages)
+            final_text, _, _ = await self._llm_call(all_messages, allow_tools=False)
             return {
                 "response": final_text,
                 "messages": messages + [{"role": "assistant", "content": final_text}],
@@ -99,7 +98,7 @@ class Agent:
             "extra": {}
         }
 
-    async def _llm_call(self, messages: list) -> tuple:
+    async def _llm_call(self, messages: list, allow_tools: bool = True) -> tuple:
         if not OPENROUTER_API_KEY:
             return "Error: OPENROUTER_API_KEY environment variable not set. Please set it and restart the agent.", [], {}
 
@@ -113,10 +112,11 @@ class Agent:
         payload = {
             "model": OPENROUTER_MODEL,
             "messages": messages,
-            "tools": self.tool_defs,
-            "tool_choice": "auto",
             "max_tokens": OPENROUTER_MAX_TOKENS,
         }
+        if allow_tools:
+            payload["tools"] = self.tool_defs
+            payload["tool_choice"] = "auto"
 
         for attempt in range(3):
             try:
@@ -140,7 +140,6 @@ class Agent:
                     retry_after = err.get("metadata", {}).get("retry_after_seconds", 5)
                     await asyncio.sleep(retry_after + 1)
                     continue
-                import logging
                 logging.error(f"OpenRouter error: status={resp.status_code}, detail={json.dumps(err)[:500]}, request_messages={len(messages)}")
                 return f"OpenRouter error ({resp.status_code}): {err.get('message', str(err))}", [], {}
 
@@ -148,7 +147,7 @@ class Agent:
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
-        content = msg.get("content", "") or ""
+        content = msg.get("content") or ""
         tool_calls_raw = msg.get("tool_calls", [])
 
         tool_calls = []

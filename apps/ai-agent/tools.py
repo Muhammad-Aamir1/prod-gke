@@ -1,5 +1,6 @@
-import subprocess, json, os, asyncio, httpx
+import subprocess, json, os, asyncio, httpx, shlex, logging
 from typing import Any
+from urllib.parse import quote
 
 TOOLS = []
 
@@ -23,12 +24,19 @@ def _run(cmd: str, timeout=30) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+def _validate_shell_safe(val: str, name: str) -> str:
+    dangerous = set(";|&`$(){}<>")
+    if any(c in val for c in dangerous):
+        raise ValueError(f"'{name}' contains disallowed shell characters")
+    return val
+
 @tool("run_kubectl", "Run any kubectl command against the GKE cluster", {
     "type": "object", "properties": {
         "command": {"type": "string", "description": "kubectl command (e.g. 'get pods -n prod-ns')"}
     }, "required": ["command"]
 })
 async def run_kubectl(command: str) -> str:
+    _validate_shell_safe(command, "command")
     return _run(f"kubectl {command}", timeout=30)
 
 @tool("run_helm", "Run any helm command", {
@@ -37,6 +45,7 @@ async def run_kubectl(command: str) -> str:
     }, "required": ["command"]
 })
 async def run_helm(command: str) -> str:
+    _validate_shell_safe(command, "command")
     return _run(f"helm {command}", timeout=30)
 
 @tool("run_gcloud", "Run any gcloud command", {
@@ -45,6 +54,7 @@ async def run_helm(command: str) -> str:
     }, "required": ["command"]
 })
 async def run_gcloud(command: str) -> str:
+    _validate_shell_safe(command, "command")
     return _run(f"gcloud {command}", timeout=30)
 
 @tool("cluster_health", "Check overall cluster health: pods, nodes, services", {
@@ -77,6 +87,7 @@ async def make_request(url: str, method: str = "GET") -> str:
     }, "required": ["path"]
 })
 async def deploy_kustomize(path: str) -> str:
+    _validate_shell_safe(path, "path")
     return _run(f"kubectl apply -k {path}", timeout=60)
 
 @tool("deploy_helm", "Deploy or upgrade a Helm chart from a directory", {
@@ -88,9 +99,13 @@ async def deploy_kustomize(path: str) -> str:
     }, "required": ["name", "path", "namespace"]
 })
 async def deploy_helm(name: str, path: str, namespace: str, values: str = "") -> str:
-    cmd = f"helm upgrade --install {name} {path} -n {namespace} --create-namespace"
+    _validate_shell_safe(name, "name")
+    _validate_shell_safe(path, "path")
+    _validate_shell_safe(namespace, "namespace")
+    cmd = f"helm upgrade --install {shlex.quote(name)} {shlex.quote(path)} -n {shlex.quote(namespace)} --create-namespace"
     if values:
-        cmd += f" -f {values}"
+        _validate_shell_safe(values, "values")
+        cmd += f" -f {shlex.quote(values)}"
     return _run(cmd, timeout=120)
 
 @tool("query_prometheus", "Query Prometheus for a metric", {
@@ -99,7 +114,8 @@ async def deploy_helm(name: str, path: str, namespace: str, values: str = "") ->
     }, "required": ["query"]
 })
 async def query_prometheus(query: str) -> str:
-    result = _run(f'kubectl exec -n monitoring deployment/monitoring-kube-prometheus-prometheus -- wget -qO- "http://localhost:9090/api/v1/query?query={query}"', timeout=15)
+    encoded = quote(query, safe='')
+    result = _run(f'kubectl exec -n monitoring deployment/monitoring-kube-prometheus-prometheus -- wget -qO- "http://localhost:9090/api/v1/query?query={encoded}"', timeout=15)
     try:
         data = json.loads(result)
         results = data.get("data", {}).get("result", [])
@@ -123,7 +139,9 @@ async def query_prometheus(query: str) -> str:
     }, "required": ["label", "namespace"]
 })
 async def read_logs(label: str, namespace: str = "prod-ns", tail: int = 20) -> str:
-    return _run(f"kubectl logs -n {namespace} -l {label} --tail={tail}", timeout=15)
+    _validate_shell_safe(label, "label")
+    _validate_shell_safe(namespace, "namespace")
+    return _run(f"kubectl logs -n {shlex.quote(namespace)} -l {shlex.quote(label)} --tail={tail}", timeout=15)
 
 @tool("restart_deployment", "Restart pods in a deployment", {
     "type": "object", "properties": {
@@ -132,7 +150,9 @@ async def read_logs(label: str, namespace: str = "prod-ns", tail: int = 20) -> s
     }, "required": ["name", "namespace"]
 })
 async def restart_deployment(name: str, namespace: str) -> str:
-    return _run(f"kubectl rollout restart deployment/{name} -n {namespace}", timeout=30)
+    _validate_shell_safe(name, "name")
+    _validate_shell_safe(namespace, "namespace")
+    return _run(f"kubectl rollout restart deployment/{shlex.quote(name)} -n {shlex.quote(namespace)}", timeout=30)
 
 def get_tool_defs():
     return [{

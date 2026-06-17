@@ -1,10 +1,11 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from jinja2 import Template
-import os, json, asyncio, uuid
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+import os, json
 
 from agent import Agent
+
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "100"))
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 
 app = FastAPI(title="prod-gke AI Agent")
 
@@ -147,10 +148,21 @@ async def root():
 async def chat(req: Request):
     body = await req.json()
     msg = body.get("message", "")
+    if not msg.strip():
+        return JSONResponse(status_code=400, content={"error": "Message is empty"})
     session_id = body.get("session_id", "default")
+
+    if len(sessions) >= MAX_SESSIONS:
+        oldest = min(sessions.keys(), key=lambda k: len(sessions[k]))
+        del sessions[oldest]
+
     if session_id not in sessions:
         sessions[session_id] = []
-    sessions[session_id].append({"role": "user", "content": msg})
+    sessions[session_id].append({"role": "user", "content": msg.strip()})
+
+    if len(sessions[session_id]) > MAX_HISTORY * 2:
+        sessions[session_id] = sessions[session_id][-MAX_HISTORY:]
+
     try:
         result = await agent.run(sessions[session_id])
         sessions[session_id] = result["messages"]
