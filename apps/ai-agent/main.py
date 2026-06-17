@@ -126,7 +126,7 @@ HTML = """<!DOCTYPE html>
   });
   sendBtn.addEventListener('click', send);
 
-  addMsg('bot', 'Hello! I\'m the prod-gke AI agent. I can:\n- Deploy and manage applications\n- Check cluster health\n- Run kubectl commands\n- Query Prometheus metrics\n- Manage monitoring\n\nWhat would you like me to do?');
+  addMsg('bot', "Hello! I'm the prod-gke AI agent. I can:\n- Deploy and manage applications\n- Check cluster health\n- Run kubectl commands\n- Query Prometheus metrics\n- Manage monitoring\n\nWhat would you like me to do?");
 </script>
 </body>
 </html>"""
