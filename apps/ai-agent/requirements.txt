@@ -4,3 +4,4 @@ httpx
 pyyaml
 jinja2
 python-multipart
+redis[hiredis]

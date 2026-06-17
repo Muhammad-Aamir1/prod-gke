@@ -7,3 +7,4 @@ resources:
   - appsets/staging-appset.yaml
   - appsets/prod-appset.yaml
   - appsets/monitoring-app.yaml
+  - appsets/ai-agent-appset.yaml

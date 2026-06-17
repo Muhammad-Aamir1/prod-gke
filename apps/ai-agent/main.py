@@ -1,16 +1,78 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-import os, json
+import os, json, time, logging, asyncio
+from collections import defaultdict
+from datetime import datetime, timezone
 
 from agent import Agent
+from tools import ROLE_TOKENS, _kubectl
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%S%z',
+)
+_logger = logging.getLogger("main")
 
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "100"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
+RATE_LIMIT_PER_SESSION = int(os.environ.get("RATE_LIMIT_PER_SESSION", "10"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
+REDIS_URL = os.environ.get("REDIS_URL", "")
 
 app = FastAPI(title="prod-gke AI Agent")
-
 agent = Agent()
+
 sessions = {}
+_rate_buckets = defaultdict(list)
+
+_redis = None
+if REDIS_URL:
+    try:
+        import redis.asyncio as aioredis
+        _redis = aioredis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=3, socket_timeout=3)
+        _logger.info("redis_connected", extra={"url": REDIS_URL})
+    except Exception as e:
+        _logger.warning("redis_connect_failed", extra={"error": str(e), "fallback": "in-memory"})
+
+def _check_rate_limit(session_id: str) -> bool:
+    now = time.monotonic()
+    bucket = _rate_buckets[session_id]
+    cutoff = now - RATE_LIMIT_WINDOW
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= RATE_LIMIT_PER_SESSION:
+        return False
+    bucket.append(now)
+    return True
+
+async def _load_session(session_id: str) -> dict | None:
+    if _redis:
+        try:
+            raw = await _redis.get(f"session:{session_id}")
+            if raw:
+                return json.loads(raw)
+        except:
+            pass
+    return sessions.get(session_id)
+
+async def _save_session(session_id: str, data: dict):
+    data["_updated"] = datetime.now(timezone.utc).isoformat()
+    if _redis:
+        try:
+            await _redis.setex(f"session:{session_id}", 86400, json.dumps(data))
+        except:
+            pass
+    sessions[session_id] = data
+
+def _rate_limit_headers(session_id: str) -> dict:
+    bucket = _rate_buckets[session_id]
+    remaining = max(0, RATE_LIMIT_PER_SESSION - len(bucket))
+    return {
+        "X-RateLimit-Limit": str(RATE_LIMIT_PER_SESSION),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Window": str(RATE_LIMIT_WINDOW),
+    }
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -21,11 +83,13 @@ HTML = """<!DOCTYPE html>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#0d1117; color:#c9d1d9; height:100vh; display:flex; flex-direction:column; }
-  .header { background:#161b22; border-bottom:1px solid #30363d; padding:16px 24px; display:flex; align-items:center; gap:12px; }
+  .header { background:#161b22; border-bottom:1px solid #30363d; padding:16px 24px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   .header h1 { font-size:18px; font-weight:600; color:#f0f6fc; }
   .header span { font-size:12px; color:#8b949e; background:#21262d; padding:2px 8px; border-radius:10px; }
   .status { margin-left:auto; display:flex; align-items:center; gap:6px; font-size:13px; }
   .status-dot { width:8px; height:8px; border-radius:50%; background:#3fb950; }
+  .status-dot.degraded { background:#d29922; }
+  .status-dot.error { background:#f85149; }
   .chat { flex:1; overflow-y:auto; padding:20px 24px; display:flex; flex-direction:column; gap:12px; }
   .msg { max-width:85%; padding:12px 16px; border-radius:8px; line-height:1.5; font-size:14px; white-space:pre-wrap; }
   .user { background:#1f6feb; color:#fff; align-self:flex-end; }
@@ -55,6 +119,10 @@ HTML = """<!DOCTYPE html>
   .role-badge.viewer { background:#0d419d; color:#58a6ff; }
   .role-badge.edit { background:#096b3e; color:#3fb950; }
   .role-badge.admin { background:#a13026; color:#f85149; }
+  .health-bar { display:flex; align-items:center; gap:6px; font-size:11px; color:#8b949e; }
+  .health-bar .ok { color:#3fb950; }
+  .health-bar .warn { color:#d29922; }
+  .health-bar .bad { color:#f85149; }
 </style>
 </head>
 <body>
@@ -70,9 +138,8 @@ HTML = """<!DOCTYPE html>
     </select>
     <span class="role-badge admin" id="roleBadge">admin</span>
   </div>
-  <div class="status">
-    <div class="status-dot"></div>
-    <span>Cluster Connected</span>
+  <div class="health-bar">
+    <span class="ok" id="healthStatus">Cluster Connected</span>
   </div>
 </div>
 <div class="chat" id="chat"></div>
@@ -88,6 +155,7 @@ HTML = """<!DOCTYPE html>
   const sendBtn = document.getElementById('sendBtn');
   const roleSelect = document.getElementById('roleSelect');
   const roleBadge = document.getElementById('roleBadge');
+  const healthStatus = document.getElementById('healthStatus');
   function genId() { try { return crypto.randomUUID(); } catch(e) { return Date.now().toString(36) + Math.random().toString(36).slice(2); } }
   let sessionId = localStorage.getItem('sessionId') || genId();
   localStorage.setItem('sessionId', sessionId);
@@ -144,8 +212,16 @@ HTML = """<!DOCTYPE html>
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({session_id: sessionId, message: msg, role: currentRole})
       });
+      if (res.status === 429) {
+        addMsg('bot error', 'Rate limit exceeded. Please wait before sending another request.');
+        return;
+      }
       const data = await res.json();
       if (data.error) { addMsg('bot error', data.error); return; }
+      if (data.rate_limit) {
+        const hdr = data.rate_limit;
+        if (parseInt(hdr.remaining) < 3) healthStatus.textContent = 'Rate limit: ' + hdr.remaining + ' remaining';
+      }
       addMsg('bot', data.response, data.extra || {});
     } catch(e) {
       addMsg('bot error', 'Connection error: ' + e.message);
@@ -169,6 +245,25 @@ HTML = """<!DOCTYPE html>
 - Manage monitoring
 
 What would you like me to do?`);
+
+  async function pollHealth() {
+    try {
+      const res = await fetch('/health');
+      const data = await res.json();
+      if (data.status === 'ok') {
+        healthStatus.textContent = 'All systems healthy';
+        healthStatus.className = 'ok';
+      } else {
+        healthStatus.textContent = 'Degraded: ' + (data.details?.openrouter || 'unknown');
+        healthStatus.className = 'warn';
+      }
+    } catch(e) {
+      healthStatus.textContent = 'Disconnected';
+      healthStatus.className = 'bad';
+    }
+  }
+  setInterval(pollHealth, 30000);
+  pollHealth();
 </script>
 </body>
 </html>"""
@@ -176,6 +271,42 @@ What would you like me to do?`);
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTML
+
+@app.get("/health")
+async def health():
+    checks = {"status": "ok", "details": {}}
+    if OPENROUTER_API_KEY:
+        checks["details"]["openrouter"] = "configured"
+    else:
+        checks["details"]["openrouter"] = "missing_api_key"
+        checks["status"] = "degraded"
+    if ROLE_TOKENS:
+        loaded = list(ROLE_TOKENS.keys())
+        checks["details"]["tokens"] = loaded
+    else:
+        checks["details"]["tokens"] = "none_loaded"
+        checks["status"] = "degraded"
+    if _redis:
+        try:
+            await _redis.ping()
+            checks["details"]["redis"] = "connected"
+        except:
+            checks["details"]["redis"] = "disconnected"
+            if checks["status"] == "ok":
+                checks["status"] = "degraded"
+    else:
+        checks["details"]["redis"] = "in-memory"
+    checks["details"]["sessions"] = len(sessions)
+    status_code = 200 if checks["status"] == "ok" else 503
+    return JSONResponse(content=checks, status_code=status_code)
+
+@app.get("/ready")
+async def ready():
+    if not OPENROUTER_API_KEY:
+        return JSONResponse(content={"status": "not_ready", "reason": "OPENROUTER_API_KEY not set"}, status_code=503)
+    if not ROLE_TOKENS:
+        return JSONResponse(content={"status": "not_ready", "reason": "no role tokens loaded"}, status_code=503)
+    return {"status": "ready", "uptime": time.monotonic()}
 
 @app.post("/api/chat")
 async def chat(req: Request):
@@ -189,23 +320,37 @@ async def chat(req: Request):
     if role not in ("viewer", "edit", "admin"):
         role = "admin"
 
-    if len(sessions) >= MAX_SESSIONS:
-        oldest = min(sessions.keys(), key=lambda k: len(sessions[k]))
-        del sessions[oldest]
+    if not _check_rate_limit(session_id):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Rate limit exceeded. Please wait before sending another request."},
+            headers=_rate_limit_headers(session_id),
+        )
 
-    if session_id not in sessions:
-        sessions[session_id] = {"messages": [], "role": role}
-    sessions[session_id]["role"] = role
-    sessions[session_id]["messages"].append({"role": "user", "content": msg.strip()})
+    session = await _load_session(session_id)
+    if session is None:
+        session = {"messages": [], "role": role}
 
-    if len(sessions[session_id]["messages"]) > MAX_HISTORY * 2:
-        sessions[session_id]["messages"] = sessions[session_id]["messages"][-MAX_HISTORY:]
+    session["role"] = role
+    session["messages"].append({"role": "user", "content": msg.strip()})
+
+    if len(session["messages"]) > MAX_HISTORY * 2:
+        session["messages"] = session["messages"][-MAX_HISTORY:]
 
     try:
-        result = await agent.run(sessions[session_id]["messages"], role=role)
-        sessions[session_id]["messages"] = result["messages"]
-        return {"response": result["response"], "extra": result.get("extra", {}), "role": role}
+        _logger.info("chat_request", extra={"session": session_id[:8], "role": role, "msg_len": len(msg)})
+        result = await agent.run(session["messages"], role=role)
+        session["messages"] = result["messages"]
+        await _save_session(session_id, session)
+
+        return {
+            "response": result["response"],
+            "extra": result.get("extra", {}),
+            "role": role,
+            "rate_limit": _rate_limit_headers(session_id),
+        }
     except Exception as e:
+        _logger.error("chat_error", extra={"session": session_id[:8], "error": str(e)})
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":

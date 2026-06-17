@@ -1,4 +1,4 @@
-import subprocess, json, os, asyncio, httpx, shlex, logging, base64, contextvars
+import subprocess, json, os, asyncio, httpx, shlex, logging, base64, contextvars, time
 from typing import Any
 from urllib.parse import quote
 
@@ -6,6 +6,10 @@ TOOLS = []
 
 ROLE_TOKENS = {}
 _current_role: contextvars.ContextVar[str] = contextvars.ContextVar("current_role", default="admin")
+
+_DESTRUCTIVE_TOOLS = {"deploy_kustomize", "deploy_helm", "restart_deployment"}
+
+_logger = logging.getLogger("tools")
 
 def load_role_tokens():
     ns = "ai-agent"
@@ -15,16 +19,23 @@ def load_role_tokens():
         pass
     for role in ["viewer", "edit", "admin"]:
         secret_name = f"agent-{role}-token"
-        try:
-            tok_raw = subprocess.run(
-                ["kubectl", "get", "secret", secret_name, "-n", ns, "-o", "jsonpath={.data.token}"],
-                capture_output=True, text=True, timeout=5
-            ).stdout.strip()
-            if tok_raw:
-                ROLE_TOKENS[role] = base64.b64decode(tok_raw).decode()
-                logging.info(f"Loaded token for role '{role}' ({len(tok_raw)} chars)")
-        except Exception as e:
-            logging.warning(f"Failed to load token for role '{role}': {e}")
+        for attempt in range(5):
+            try:
+                tok_raw = subprocess.run(
+                    ["kubectl", "get", "secret", secret_name, "-n", ns, "-o", "jsonpath={.data.token}"],
+                    capture_output=True, text=True, timeout=5
+                ).stdout.strip()
+                if tok_raw:
+                    ROLE_TOKENS[role] = base64.b64decode(tok_raw).decode()
+                    _logger.info("loaded_token", extra={"role": role, "len": len(tok_raw), "attempt": attempt + 1})
+                    break
+                elif attempt < 4:
+                    time.sleep(2 ** attempt)
+            except Exception as e:
+                if attempt < 4:
+                    time.sleep(2 ** attempt)
+                else:
+                    _logger.warning("failed_to_load_token", extra={"role": role, "error": str(e)})
 
 def set_role(role: str):
     _current_role.set(role)
@@ -50,6 +61,24 @@ def tool(name, desc, params):
         return fn
     return dec
 
+_SAFE_CMD_PREFIXES = {
+    "get", "list", "describe", "logs", "top", "api-resources", "api-versions",
+    "explain", "version", "cluster-info", "config",
+}
+
+def _is_read_only_kubectl(cmd: str) -> bool:
+    first = cmd.strip().split()[0] if cmd.strip() else ""
+    return first in _SAFE_CMD_PREFIXES
+
+def _validate_shell_safe(val: str, name: str) -> str:
+    role = get_role()
+    if role == "admin":
+        return val
+    dangerous = set(";|&`$(){}<>")
+    if any(c in val for c in dangerous):
+        raise ValueError(f"'{name}' contains disallowed shell characters (blocked for {role} role)")
+    return val
+
 def _run(cmd: str, timeout=30) -> str:
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
@@ -62,12 +91,6 @@ def _run(cmd: str, timeout=30) -> str:
         return "Error: command timed out"
     except Exception as e:
         return f"Error: {e}"
-
-def _validate_shell_safe(val: str, name: str) -> str:
-    dangerous = set(";|&`$(){}<>")
-    if any(c in val for c in dangerous):
-        raise ValueError(f"'{name}' contains disallowed shell characters")
-    return val
 
 @tool("run_kubectl", "Run any kubectl command against the GKE cluster", {
     "type": "object", "properties": {

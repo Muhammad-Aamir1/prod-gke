@@ -3,10 +3,13 @@ from tools import get_tool_defs, call_tool, set_role, get_role
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+OPENROUTER_FALLBACK_MODELS = (os.environ.get("OPENROUTER_FALLBACK_MODELS", "openrouter/auto")).split(",")
 OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "2000"))
 SITE_URL = os.environ.get("SITE_URL", "http://localhost:8080")
 SITE_NAME = "prod-gke AI Agent"
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
+
+_logger = logging.getLogger("agent")
 
 def make_system_prompt(role: str = "admin") -> str:
     return f"""You are a DevOps AI agent managing a production GKE cluster called prod-gke. You have full access to kubectl, helm, gcloud, and can make HTTP requests.
@@ -15,7 +18,7 @@ def make_system_prompt(role: str = "admin") -> str:
 Your kubectl commands run with the role selected by the user. Respect your role's limitations:
 - viewer: read-only access to cluster resources (can view but not create/update/delete)
 - edit: can modify resources but not RBAC
-- admin: full cluster-admin access
+- admin: full cluster-admin access and shell access (pipelines, chaining commands allowed)
 If a command fails due to permissions, inform the user and suggest a higher role.
 
 ## Cluster Overview
@@ -51,7 +54,7 @@ You have these tools available. Use them to fulfill user requests:
 - When deploying, verify the resources were created successfully
 - For application issues, check logs first, then pod status, then events
 - Keep responses concise but informative
-- Always confirm before making destructive changes
+- Always confirm before making destructive changes. Ask the user "I can [action], shall I proceed?" and wait for explicit yes before calling destructive tools
 - When the user asks about monitoring, check Prometheus and Grafana
 - Call tools using the function calling API (the system will handle tool execution)
 - After calling tools, summarize the results for the user in plain text
@@ -66,6 +69,7 @@ You have these tools available. Use them to fulfill user requests:
 class Agent:
     def __init__(self):
         self.tool_defs = get_tool_defs()
+        self._models = [OPENROUTER_MODEL] + [m for m in OPENROUTER_FALLBACK_MODELS if m.strip()]
 
     async def run(self, messages: list, role: str = "admin") -> dict:
         set_role(role)
@@ -112,7 +116,7 @@ class Agent:
 
     async def _llm_call(self, messages: list, allow_tools: bool = True) -> tuple:
         if not OPENROUTER_API_KEY:
-            return "Error: OPENROUTER_API_KEY environment variable not set. Please set it and restart the agent.", [], {}
+            return "Error: OPENROUTER_API_KEY environment variable not set.", [], {}
 
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -121,59 +125,76 @@ class Agent:
             "X-Title": SITE_NAME,
         }
 
-        payload = {
-            "model": OPENROUTER_MODEL,
-            "messages": messages,
-            "max_tokens": OPENROUTER_MAX_TOKENS,
-        }
-        if allow_tools:
-            payload["tools"] = self.tool_defs
-            payload["tool_choice"] = "auto"
+        models_to_try = list(self._models)
+        last_error = ""
 
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=90) as client:
-                    resp = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
-                    data = resp.json()
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return f"Error calling OpenRouter: {e}", [], {}
+        for model_idx, model in enumerate(models_to_try):
+            payload = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": OPENROUTER_MAX_TOKENS,
+            }
+            if allow_tools and model_idx == 0:
+                payload["tools"] = self.tool_defs
+                payload["tool_choice"] = "auto"
 
-            if "error" in data:
-                err = data["error"]
-                code = err.get("code", 0)
-                if code == 429 and attempt < 2:
-                    retry_after = err.get("metadata", {}).get("retry_after_seconds", 5)
-                    await asyncio.sleep(retry_after + 1)
-                    continue
-                logging.error(f"OpenRouter error: status={resp.status_code}, detail={json.dumps(err)[:500]}, request_messages={len(messages)}")
-                return f"OpenRouter error ({resp.status_code}): {err.get('message', str(err))}", [], {}
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=90) as client:
+                        resp = await client.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        )
+                        data = resp.json()
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    break
 
-            break
+                if "error" in data:
+                    err = data["error"]
+                    code = err.get("code", 0)
+                    msg_text = err.get("message", str(err))
+                    last_error = f"{resp.status_code}: {msg_text}"
+                    if code == 429 and attempt < 2:
+                        retry_after = err.get("metadata", {}).get("retry_after_seconds", 5)
+                        await asyncio.sleep(retry_after + 1)
+                        continue
+                    _logger.warning("llm_error", extra={
+                        "model": model, "status": resp.status_code,
+                        "error": msg_text[:200], "attempt": attempt + 1
+                    })
+                    break
 
-        choice = data.get("choices", [{}])[0]
-        msg = choice.get("message", {})
-        content = msg.get("content") or ""
-        tool_calls_raw = msg.get("tool_calls", [])
+                choice = data.get("choices", [{}])[0]
+                msg = choice.get("message", {})
+                content = msg.get("content") or ""
+                tool_calls_raw = msg.get("tool_calls", [])
 
-        tool_calls = []
-        for tc in tool_calls_raw:
-            fn = tc.get("function", {})
-            args_raw = fn.get("arguments", "{}")
-            try:
-                args = json.loads(args_raw)
-            except json.JSONDecodeError:
-                args = {"raw_args": args_raw}
-            tool_calls.append({
-                "id": tc.get("id", ""),
-                "name": fn.get("name", "unknown"),
-                "arguments": args,
-            })
+                tool_calls = []
+                for tc in tool_calls_raw:
+                    fn = tc.get("function", {})
+                    args_raw = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        args = {"raw_args": args_raw}
+                    tool_calls.append({
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", "unknown"),
+                        "arguments": args,
+                    })
 
-        return content, tool_calls, msg
+                return content, tool_calls, msg
+
+            if model_idx < len(models_to_try) - 1:
+                _logger.info("fallback_model", extra={
+                    "from": model, "to": models_to_try[model_idx + 1], "reason": last_error
+                })
+
+        err_msg = f"All models failed. Last error: {last_error}"
+        _logger.error("all_models_failed", extra={"error": last_error})
+        return f"Error: {err_msg}", [], {}

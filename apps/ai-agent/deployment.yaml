@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-agent
+  namespace: ai-agent
+  labels:
+    app: ai-agent
+    environment: production
+    app.kubernetes.io/name: ai-agent
+    app.kubernetes.io/component: ai-agent
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: ai-agent
+  template:
+    metadata:
+      labels:
+        app: ai-agent
+        environment: production
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - ai-agent
+              topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 30
+      containers:
+      - name: ai-agent
+        image: us-central1-docker.pkg.dev/second-project-497312/app-images/ai-agent:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        env:
+        - name: OPENROUTER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openrouter-key
+              key: api-key
+        - name: OPENROUTER_MODEL
+          value: "openrouter/free"
+        - name: OPENROUTER_FALLBACK_MODELS
+          value: "openrouter/auto"
+        - name: SITE_URL
+          value: "http://136.116.72.211"
+        - name: MAX_SESSIONS
+          value: "100"
+        - name: MAX_HISTORY
+          value: "20"
+        - name: RATE_LIMIT_PER_SESSION
+          value: "10"
+        - name: RATE_LIMIT_WINDOW
+          value: "60"
+        - name: REDIS_URL
+          value: "redis://redis-svc.prod-ns.svc.cluster.local:6379/0"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 5
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 20
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ai-agent-pdb
+  namespace: ai-agent
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ai-agent
