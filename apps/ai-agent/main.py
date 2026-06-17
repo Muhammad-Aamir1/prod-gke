@@ -61,8 +61,8 @@ HTML = """<!DOCTYPE html>
 <div class="chat" id="chat"></div>
 <div class="loading" id="loading"><div class="spinner"></div><span>Agent is thinking...</span></div>
 <div class="input-row">
-  <textarea id="input" placeholder="Tell the agent what to do..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
-  <button id="sendBtn" onclick="send()">Send</button>
+  <textarea id="input" placeholder="Tell the agent what to do..." rows="1"></textarea>
+  <button id="sendBtn">Send</button>
 </div>
 <script>
   const chat = document.getElementById('chat');
@@ -120,6 +120,11 @@ HTML = """<!DOCTYPE html>
       input.focus();
     }
   }
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  sendBtn.addEventListener('click', send);
 
   addMsg('bot', 'Hello! I\'m the prod-gke AI agent. I can:\n- Deploy and manage applications\n- Check cluster health\n- Run kubectl commands\n- Query Prometheus metrics\n- Manage monitoring\n\nWhat would you like me to do?');
 </script>
