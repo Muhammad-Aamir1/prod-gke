@@ -37,14 +37,23 @@ A production-grade **Google Kubernetes Engine (GKE)** reference architecture wit
                │         │  Operator (ESO)     │
                │         └────────────────────┘
                │
-      ┌────────▼───────────────────────────────────────┐
-      │            Monitoring (monitoring ns)            │
-      │  ┌─────────────────┐      ┌──────────────────┐  │
-      │  │   Prometheus    │──────│    Grafana        │  │
-      │  │   StatefulSet   │◀─────│   LoadBalancer    │  │
-      │  │   ClusterIP:9090│      │   :80 → :3000     │  │
-      │  └─────────────────┘      └──────────────────┘  │
-      └──────────────────────────────────────────────────┘
+       ┌────────▼───────────────────────────────────────┐
+       │         Monitoring (monitoring ns)              │
+       │  ┌──────────────────────────────────────────┐   │
+       │  │         kube-prometheus-stack            │   │
+       │  │  (Helm chart)                             │   │
+       │  │  ┌──────────────┐  ┌──────────────────┐  │   │
+       │  │  │  Prometheus  │──│    Grafana        │  │   │
+       │  │  │  Operator    │  │   LoadBalancer    │  │   │
+       │  │  │  StatefulSet │  │   :80 → :3000     │  │   │
+       │  │  └──────┬───────┘  └──────────────────┘  │   │
+       │  │         │                                 │   │
+       │  │  ┌──────▼───────┐  ┌──────────────────┐  │   │
+       │  │  │ Node Exporter│  │kube-state-metrics │  │   │
+       │  │  │ (DaemonSet)  │  │   (Deployment)    │  │   │
+       │  │  └──────────────┘  └──────────────────┘  │   │
+       │  └──────────────────────────────────────────┘   │
+       └──────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
 │                      Infrastructure Layer                        │
@@ -111,12 +120,10 @@ prod-gke/
 │       ├── prod-appset.yaml
 │       └── monitoring-app.yaml
 │
-├── 04-monitoring/             # Prometheus + Grafana in-cluster monitoring
-│   ├── 00-namespace-rbac.yaml     # monitoring namespace + SA + ClusterRole
-│   ├── 01-prometheus-config.yaml  # Prometheus scrape config (pods, nodes, kubelet)
-│   ├── 02-prometheus.yaml         # Prometheus StatefulSet (10Gi PVC, ClusterIP)
-│   ├── 03-grafana-config.yaml     # Grafana datasource + provisioned dashboards
-│   └── 04-grafana.yaml            # Grafana Deployment (5Gi PVC, LoadBalancer)
+├── 04-monitoring/             # Prometheus + Grafana monitoring (Helm chart)
+│   ├── Chart.yaml              # Helm chart with kube-prometheus-stack dependency
+│   ├── values.yaml             # Custom values for Prometheus, Grafana, exporters
+│   └── charts/                 # Vendored chart dependencies (kube-prometheus-stack)
 │
 ├── apps/                      # Application source code
 │   ├── backend/
@@ -292,51 +299,49 @@ Express.js server that:
 ### Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  monitoring namespace                                      │
-│                                                            │
-│  ┌──────────────┐         ┌──────────────┐                │
-│  │  Prometheus   │◄────────│  Grafana     │                │
-│  │  StatefulSet  │────────►│  LoadBalancer│                │
-│  │  ClusterIP:90 │ scrape  │  :80 → :3000 │                │
-│  └──────┬───────┘         └──────────────┘                │
-│         │                                                 │
-│         │ Scrape targets:                                  │
-│         │  • kubernetes-pods (via prometheus.io annotations)│
-│         │  • kubernetes-nodes (cAdvisor metrics)           │
-│         │  • kubernetes-kubelet (/metrics/cadvisor)        │
-│         │  • prometheus itself (localhost:9090)             │
-│         └─────────────────────────────────────────────────┘
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  monitoring namespace (managed by Helm)                      │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │              kube-prometheus-stack                     │  │
+│  │  ┌──────────────┐        ┌──────────────────────────┐  │  │
+│  │  │  Prometheus  │────────│      Grafana              │  │  │
+│  │  │  Operator    │ scrape │     LoadBalancer          │  │  │
+│  │  │  StatefulSet │◄───────│      :80 → :3000          │  │  │
+│  │  │  ClusterIP   │        │  admin/prom-operator      │  │  │
+│  │  └──────┬───────┘        └──────────────────────────┘  │  │
+│  │         │                                               │  │
+│  │  ┌──────▼────────────────────────────────────────┐     │  │
+│  │  │  ServiceMonitors / PodMonitors (auto-discover) │     │  │
+│  │  │  • kube-api-server    • kubelet / cAdvisor     │     │  │
+│  │  │  • kube-proxy         • kube-state-metrics     │     │  │
+│  │  │  • node-exporter      • core-dns               │     │  │
+│  │  │  • apps with prometheus.io/scrape annotations  │     │  │
+│  │  └────────────────────────────────────────────────┘     │  │
+│  │                                                         │  │
+│  │  ┌──────────────────┐  ┌────────────────────────┐      │  │
+│  │  │  Node Exporter   │  │  kube-state-metrics    │      │  │
+│  │  │  (DaemonSet)     │  │  (Deployment)           │      │  │
+│  │  └──────────────────┘  └────────────────────────┘      │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Prometheus (`04-monitoring/`)
+### Monitoring Stack (`04-monitoring/`)
 
-- **Type**: StatefulSet with 10Gi PVC, 7-day retention
-- **Version**: `prom/prometheus:v2.53.0`
-- **Service**: ClusterIP on port 9090
-- **Scrape Jobs**:
-  - `prometheus` — Self-scrape
-  - `kubernetes-nodes` — Node-level metrics via cAdvisor
-  - `kubernetes-pods` — Pod-level metrics (auto-discovers pods with `prometheus.io/scrape: "true"` annotation)
-  - `kubernetes-kubelet` — Kubelet cAdvisor metrics over HTTPS
+Monitoring is packaged as a **Helm chart** using `kube-prometheus-stack` (v86.2.3), which bundles Prometheus Operator, Prometheus, Grafana, Node Exporter, and kube-state-metrics into a single deployable unit.
 
-Resources: requests 200m CPU / 512Mi memory, limits 500m CPU / 1Gi memory.
+| Component | Type | Details |
+|-----------|------|---------|
+| **Prometheus** | StatefulSet | 10Gi PVC, 7-day retention, requests 200m/512Mi, limits 500m/1Gi |
+| **Prometheus Operator** | Deployment | Manages Prometheus/Alertmanager instances via CRDs |
+| **Grafana** | Deployment | 5Gi PVC, LoadBalancer :80→3000, admin/prom-operator |
+| **Node Exporter** | DaemonSet | Node-level metrics (CPU, memory, disk, network) |
+| **kube-state-metrics** | Deployment | Cluster-level metrics (deployments, pods, nodes state) |
+| **Alertmanager** | Disabled | Can be enabled via values.yaml if needed |
 
-### Grafana (`04-monitoring/`)
+**Scraping**: Prometheus Operator uses custom resource definitions (ServiceMonitor, PodMonitor) to automatically discover and scrape metrics. The chart includes pre-configured ServiceMonitors for all Kubernetes control plane components (API server, kubelet, kube-proxy, core-dns) and auto-discovers application pods with `prometheus.io/scrape: "true"` annotations.
 
-- **Type**: Deployment with 5Gi PVC
-- **Version**: `grafana/grafana:11.0.0`
-- **Service**: LoadBalancer on port 80 → 3000
-- **Credentials**: `admin` / `prom-operator`
-- **Provisioned Datasources**: Prometheus (auto-connected to `http://prometheus:9090`)
-- **Provisioned Dashboards**:
-
-#### 1. Kubernetes Cluster Dashboard
-Sections: Cluster Overview, Cluster Resources (CPU/Memory/Network by node), Namespace Resources, Container Resources (CPU/Memory/Throttling by pod), Scrape Targets & Health
-
-#### 2. prod-gke Application Dashboard
-Sections: Application Overview (CPU, Memory, Heap %, Active Handles/Requests, Event Loop Lag, Process RSS, Node.js Instances), Node.js Memory & GC (Heap Total vs Used, Heap Space Breakdown, GC Rate/Count, External Memory), Event Loop & Concurrency (Event Loop Latency p50/p90/p99, Active Handles/Requests, Libuv Threads)
+**Dashboards**: Grafana is pre-loaded with default Kubernetes dashboards. Custom dashboards can be added via `grafana.dashboards` in values.yaml or auto-discovered via ConfigMaps with `grafana_dashboard: "1"` label.
 
 ### Network Policy for Monitoring
 
@@ -452,8 +457,9 @@ The project uses **ArgoCD** as its GitOps operator. After bootstrapping, ArgoCD 
 │                      Git Repository                          │
 │  ┌─────────────────┐  ┌────────────────┐  ┌──────────────┐  │
 │  │ 03-k8s-manifests│  │ 04-monitoring  │  │ 04-argocd    │  │
-│  │ overlays/<env>/ │  │ Prometheus/    │  │ Application  │  │
-│  │ Kustomize       │  │ Grafana YAML   │  │ Sets + Apps  │  │
+│  │ overlays/<env>/ │  │ Helm chart     │  │ Application  │  │
+│  │ Kustomize       │  │ kube-prometheus│  │ Sets + Apps  │  │
+│  │                 │  │ -stack         │  │              │  │
 │  └────────┬────────┘  └───────┬────────┘  └──────┬───────┘  │
 └───────────┼──────────────────┼───────────────────┼──────────┘
             │                  │                   │
@@ -461,10 +467,11 @@ The project uses **ArgoCD** as its GitOps operator. After bootstrapping, ArgoCD 
     ┌───────────────────────────────────────────────────────┐
     │                  ArgoCD (argocd ns)                    │
     │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  │
-    │  │ AppSet: dev  │  │ AppSet: prod │  │ App:        │  │
+    │  │ AppSet: dev  │  │ AppSet: prod │  │ App:         │  │
     │  │ → dev overlay│  │ → prod       │  │ monitoring  │  │
     │  │              │  │   overlay    │  │ → 04-       │  │
     │  │              │  │              │  │   monitoring│  │
+    │  │              │  │              │  │   (Helm)    │  │
     │  └──────────────┘  └──────────────┘  └─────────────┘  │
     └──────────────────────────┬────────────────────────────┘
                                │
