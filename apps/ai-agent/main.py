@@ -69,7 +69,8 @@ HTML = """<!DOCTYPE html>
   const input = document.getElementById('input');
   const loading = document.getElementById('loading');
   const sendBtn = document.getElementById('sendBtn');
-  let sessionId = localStorage.getItem('sessionId') || crypto.randomUUID();
+  function genId() { try { return crypto.randomUUID(); } catch(e) { return Date.now().toString(36) + Math.random().toString(36).slice(2); } }
+  let sessionId = localStorage.getItem('sessionId') || genId();
   localStorage.setItem('sessionId', sessionId);
 
   function addMsg(type, content, extra) {
