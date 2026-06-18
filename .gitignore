@@ -34,6 +34,10 @@ terraform.tfvars.json
 *.swo
 *~
 
+# Python cache
+__pycache__/
+*.pyc
+
 # Scratch / junk files
 more.txt
 nul.bak

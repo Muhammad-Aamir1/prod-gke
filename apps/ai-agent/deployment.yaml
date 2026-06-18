@@ -49,7 +49,7 @@ spec:
           valueFrom:
             secretKeyRef:
               name: openrouter-key
-              key: api-key
+              key: OPENROUTER_API_KEY
         - name: OPENROUTER_MODEL
           value: "openrouter/free"
         - name: OPENROUTER_FALLBACK_MODELS
@@ -87,15 +87,16 @@ spec:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 15
-          timeoutSeconds: 5
+          timeoutSeconds: 10
           failureThreshold: 5
         startupProbe:
           httpGet:
             path: /health
             port: 8080
           initialDelaySeconds: 5
-          periodSeconds: 5
-          failureThreshold: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

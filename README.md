@@ -118,6 +118,7 @@ prod-gke/
 │       ├── dev-appset.yaml
 │       ├── staging-appset.yaml
 │       ├── prod-appset.yaml
+│       ├── ai-agent-appset.yaml   # AI Agent ApplicationSet
 │       └── monitoring-app.yaml
 │
 ├── 04-monitoring/             # Prometheus + Grafana monitoring (Helm chart)
@@ -126,6 +127,16 @@ prod-gke/
 │   └── charts/                 # Vendored chart dependencies (kube-prometheus-stack)
 │
 ├── apps/                      # Application source code
+│   ├── ai-agent/              # AI-powered DevOps assistant
+│   │   ├── agent.py           # OpenRouter integration, model fallback chain, dynamic system prompt
+│   │   ├── main.py            # FastAPI server, health/ready endpoints, rate limiting, Redis sessions
+│   │   ├── tools.py           # Tool registry, RBAC, shell validation, kubectl/helm/gcloud wrappers
+│   │   ├── deployment.yaml    # K8s Deployment with probes, anti-affinity, PDB
+│   │   ├── service.yaml       # LoadBalancer service (port 80 → 8080)
+│   │   ├── namespace.yaml     # ai-agent namespace
+│   │   ├── rbac.yaml          # ServiceAccounts, ClusterRoleBindings, token secrets
+│   │   ├── Dockerfile         # Python 3.12-slim with kubectl, helm, gcloud
+│   │   └── requirements.txt   # fastapi, uvicorn, httpx, redis[hiredis]
 │   ├── backend/
 │   │   ├── package.json       # express, pg, ioredis, prom-client
 │   │   ├── server.js          # Health check, /metrics, /data endpoints
@@ -234,6 +245,10 @@ docker push us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/backend:latest
 # Build and push frontend
 docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/frontend:latest apps/frontend
 docker push us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/frontend:latest
+
+# Build and push AI agent
+docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/ai-agent:latest apps/ai-agent
+docker push us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/ai-agent:latest
 ```
 
 ### 6. Applications + Monitoring (Auto-deployed by ArgoCD)
@@ -293,6 +308,148 @@ Express.js server that:
 
 - **PostgreSQL**: StatefulSet with 10Gi PVC, `pg_isready` probes, `restricted` Pod Security
 - **Redis**: Deployment with AOF persistence, TCP probes, `emptyDir` for data
+
+## AI Agent (`apps/ai-agent/`)
+
+An AI-powered DevOps assistant that manages the GKE cluster through natural language. It runs as a FastAPI server with a web chat UI, leveraging OpenRouter to access LLMs.
+
+### Architecture
+
+```
+User (Browser / API)
+  │  POST /api/chat { message, role, session_id }
+  ▼
+┌─────────────────────────────────────────────┐
+│              FastAPI Server (main.py)        │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  │
+│  │  Rate    │  │  Session │  │  Redis    │  │
+│  │  Limiter │──│  Manager │──│  Backed   │  │
+│  │  10/min  │  │  in-mem  │  │  (opt.)   │  │
+│  └──────────┘  └────┬─────┘  └───────────┘  │
+└─────────────────────┼────────────────────────┘
+                      │ messages
+                      ▼
+┌─────────────────────────────────────────────┐
+│           Agent (agent.py)                   │
+│  ┌──────────────────────────────────────┐   │
+│  │  Model Fallback Chain               │   │
+│  │  openrouter/free → openrouter/auto  │   │
+│  │  (3 retries per model, exp backoff) │   │
+│  └──────────────────┬───────────────────┘   │
+│                     │ tool_calls             │
+│                     ▼                        │
+│  ┌──────────────────────────────────────┐   │
+│  │  Tool Execution (tools.py)           │   │
+│  │  ┌──────────┐ ┌──────────┐          │   │
+│  │  │ kubectl  │ │ helm     │          │   │
+│  │  │ (RBAC)   │ │ (RBAC)   │          │   │
+│  │  └──────────┘ └──────────┘          │   │
+│  │  ┌──────────┐ ┌──────────┐          │   │
+│  │  │ gcloud   │ │ PromQL   │          │   │
+│  │  └──────────┘ └──────────┘          │   │
+│  └──────────────────────────────────────┘   │
+└─────────────────────────────────────────────┘
+```
+
+### Features
+
+| Feature | Implementation |
+|---------|---------------|
+| **Chat UI** | Dark-themed HTML interface with role selector, tool call display |
+| **RBAC Roles** | viewer (read-only), edit (modify resources), admin (full access + shell) |
+| **Rate Limiting** | 10 requests per 60-second window per session |
+| **Session Persistence** | In-memory or Redis-backed (set via `REDIS_URL`) |
+| **Model Fallback** | Tries `openrouter/free` → `openrouter/auto` with 3 retries + exponential backoff |
+| **Health Probes** | `/health` (liveness), `/ready` (readiness + startup) |
+| **Pod Anti-Affinity** | Prefers spreading replicas across different nodes |
+| **PodDisruptionBudget** | minAvailable: 1 |
+
+### RBAC Roles
+
+The agent supports three roles, selected via the web UI dropdown or the `role` field in the API:
+
+| Role | ClusterRole | Permissions | Shell Access |
+|------|-------------|-------------|--------------|
+| `viewer` | `view` | Read-only kubectl (get, list, describe, logs) | No |
+| `edit` | `edit` | Modify resources, no RBAC changes | No |
+| `admin` | `cluster-admin` | Full cluster control | Yes (pipes, chains allowed) |
+
+Role tokens are stored in Kubernetes Secrets (`agent-viewer-token`, `agent-edit-token`, `agent-admin-token`) and loaded at pod startup with retry/backoff.
+
+### Available Tools
+
+The agent exposes 10 tools to the LLM:
+
+| Tool | Description |
+|------|-------------|
+| `run_kubectl` | Run any kubectl command (respects RBAC role) |
+| `run_helm` | Run helm commands (respects RBAC role) |
+| `run_gcloud` | Run gcloud commands (respects RBAC role) |
+| `cluster_health` | Get comprehensive cluster health (pods, nodes, services, PVCs) |
+| `make_request` | Make HTTP requests to cluster services |
+| `deploy_kustomize` | Deploy Kustomize overlays from a path |
+| `deploy_helm` | Deploy/upgrade Helm charts |
+| `query_prometheus` | Query Prometheus via PromQL |
+| `read_logs` | Read pod logs by label selector |
+| `restart_deployment` | Rollout restart a deployment |
+
+Destructive tools (`deploy_kustomize`, `deploy_helm`, `restart_deployment`) require explicit user confirmation before execution.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (required) |
+| `OPENROUTER_MODEL` | `openrouter/free` | Primary model |
+| `OPENROUTER_FALLBACK_MODELS` | `openrouter/auto` | Fallback models (comma-separated) |
+| `MAX_SESSIONS` | `100` | Max concurrent sessions |
+| `MAX_HISTORY` | `20` | Max conversation history turns |
+| `RATE_LIMIT_PER_SESSION` | `10` | Requests per window |
+| `RATE_LIMIT_WINDOW` | `60` | Window in seconds |
+| `REDIS_URL` | — | Redis URL for session persistence (e.g. `redis://redis-svc.prod-ns.svc.cluster.local:6379/0`) |
+| `SITE_URL` | `http://localhost:8080` | Referer for OpenRouter |
+
+### Building and Deploying
+
+```bash
+# Build and push the AI agent image
+docker build -t us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/ai-agent:latest apps/ai-agent
+docker push us-central1-docker.pkg.dev/<PROJECT_ID>/app-images/ai-agent:latest
+
+# Deploy manifests (via ArgoCD or manually)
+kubectl apply -f apps/ai-agent/namespace.yaml
+kubectl apply -f apps/ai-agent/rbac.yaml
+
+# Create the OpenRouter API key secret
+kubectl create secret generic openrouter-key \
+  -n ai-agent \
+  --from-literal=OPENROUTER_API_KEY=<your_key>
+
+kubectl apply -f apps/ai-agent/deployment.yaml
+kubectl apply -f apps/ai-agent/service.yaml
+```
+
+The agent is also deployed via ArgoCD through the `prod-gke-ai-agent` ApplicationSet in `04-argocd/appsets/ai-agent-appset.yaml`.
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web chat UI |
+| `/health` | GET | Liveness probe (always 200, details in body) |
+| `/ready` | GET | Readiness probe (200 if API key + tokens loaded) |
+| `/api/chat` | POST | Chat with the agent |
+
+### Accessing the Agent
+
+```bash
+# Get the external LoadBalancer IP
+kubectl get svc ai-agent -n ai-agent
+
+# Or port-forward
+kubectl port-forward svc/ai-agent -n ai-agent 8080:80
+# Visit http://localhost:8080
+```
 
 ## Monitoring Stack
 
@@ -502,6 +659,8 @@ ArgoCD respects sync-wave annotations to deploy resources in the correct order:
 | `3` | Frontend Web + HPA | Needs Backend |
 | `4` | Gateway + Certificates | Needs Frontend Service |
 | `5` | PodDisruptionBudgets | Final safety layer |
+
+The **AI Agent** (`ai-agent-appset`) deploys independently in the `ai-agent` namespace and is not part of the sync wave ordering. It can be synced at any time.
 
 ### Workflow
 

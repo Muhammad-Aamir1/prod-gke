@@ -103,7 +103,7 @@ metadata:
   namespace: ai-agent
 subjects:
 - kind: ServiceAccount
-  name: default
+  name: ai-agent
   namespace: ai-agent
 roleRef:
   kind: Role

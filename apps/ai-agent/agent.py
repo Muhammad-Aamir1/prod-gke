@@ -1,4 +1,4 @@
-import os, json, asyncio, httpx, logging
+import os, json, asyncio, httpx, logging, difflib, shlex
 from tools import get_tool_defs, call_tool, set_role, get_role
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -66,22 +66,96 @@ You have these tools available. Use them to fulfill user requests:
   - Use simple lines like: Status: healthy
 """
 
+_KNOWN_WORDS = {
+    "kubectl", "helm", "gcloud", "argocd", "prometheus", "grafana", "kubernetes",
+    "deployment", "service", "pod", "namespace", "configmap", "secret", "ingress",
+    "statefulset", "daemonset", "replicaset", "pv", "pvc", "storageclass",
+    "cluster", "node", "proxy", "rollout", "restart", "scale", "logs", "describe",
+    "create", "apply", "delete", "edit", "get", "list", "watch", "exec",
+    "frontend", "backend", "postgres", "redis", "monitoring", "prod-ns",
+    "loadbalancer", "clusterip", "nodeport", "rollback", "health", "status",
+    "deploy", "upgrade", "install", "uninstall", "rollback", "release",
+    "pods", "services", "deployments", "namespaces", "configmaps", "secrets",
+    "ingresses", "statefulsets", "daemonsets", "replicasets", "persistentvolumes",
+    "persistentvolumeclaims", "storageclasses", "nodes", "clusters",
+    "kubectl", "helm", "gcloud", "argocd", "prometheus", "grafana",
+    "application", "applicationset", "sync", "healthy", "degraded", "outofsync",
+}
+
+def _suggest_spelling_fix(text: str) -> tuple[str, list[str]]:
+    tokens = shlex.split(text) if shlex.split(text) else text.split()
+    corrections = []
+    fixed_tokens = []
+    for t in tokens:
+        t_lower = t.lower()
+        if t_lower not in _KNOWN_WORDS and len(t) > 2:
+            matches = difflib.get_close_matches(t_lower, _KNOWN_WORDS, n=1, cutoff=0.7)
+            if matches:
+                suggestion = matches[0]
+                if t_lower != suggestion:
+                    corrections.append(f"\"{t}\" -> \"{suggestion}\"")
+                    fixed_tokens.append(suggestion if t[0].islower() else suggestion.capitalize())
+                    continue
+        fixed_tokens.append(t)
+    return " ".join(fixed_tokens), corrections
+
+def _correct_spelling(messages: list) -> list:
+    corrected = []
+    for msg in messages:
+        if msg.get("role") == "user" and msg.get("content"):
+            fixed, corrections = _suggest_spelling_fix(msg["content"])
+            if corrections:
+                _logger.info("spelling_corrections", extra={"corrections": corrections})
+                fixed_msg = dict(msg)
+                fixed_msg["content"] = fixed
+                fixed_msg["_original"] = msg["content"]
+                fixed_msg["_corrections"] = corrections
+                corrected.append(fixed_msg)
+                continue
+        corrected.append(msg)
+    return corrected
+
 class Agent:
     def __init__(self):
         self.tool_defs = get_tool_defs()
-        self._models = [OPENROUTER_MODEL] + [m for m in OPENROUTER_FALLBACK_MODELS if m.strip()]
+        self._models = [m.strip() for m in [OPENROUTER_MODEL] + OPENROUTER_FALLBACK_MODELS if m.strip()]
 
     async def run(self, messages: list, role: str = "admin") -> dict:
         set_role(role)
+        corrected = _correct_spelling(messages)
+        corrections = []
+        for m in corrected:
+            corr = m.pop("_corrections", None) if isinstance(m, dict) else None
+            if corr:
+                corrections.extend(corr)
         system_msg = {"role": "system", "content": make_system_prompt(role)}
-        all_messages = [system_msg] + messages
+        all_messages = [system_msg] + corrected
 
-        response_text, tool_calls, assistant_msg = await self._llm_call(all_messages)
+        for loop_attempt in range(3):
+            response_text, tool_calls, assistant_msg = await self._llm_call(all_messages)
 
-        if tool_calls:
+            if not tool_calls:
+                text = response_text
+                if corrections:
+                    text = "Note: assuming you meant " + ", ".join(corrections) + "\n\n" + text
+                if text and not text.startswith("Error:"):
+                    return {
+                        "response": text,
+                        "messages": messages + [{"role": "assistant", "content": text}],
+                        "extra": {"spelling_corrections": corrections} if corrections else {}
+                    }
+                if loop_attempt < 2:
+                    _logger.warning("retry_empty_response", extra={"attempt": loop_attempt + 1})
+                    continue
+                return {
+                    "response": text or "I encountered an issue processing your request. Please try again.",
+                    "messages": messages + [{"role": "assistant", "content": text or ""}],
+                    "extra": {"spelling_corrections": corrections} if corrections else {}
+                }
+
             all_messages.append(assistant_msg)
-
             extra = {"tool_calls": []}
+
             for tc in tool_calls:
                 set_role(role)
                 name = tc.get("name")
@@ -96,27 +170,129 @@ class Agent:
                 all_messages.append({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": result[:3000] if len(result) > 3000 else result
+                    "content": result[:4000] if len(result) > 4000 else result
                 })
 
-            final_text, _, _ = await self._llm_call(all_messages, allow_tools=False)
-            text = final_text or "Command executed. Check the tool results above for details."
+            final_text, final_tools, _ = await self._llm_call(all_messages, allow_tools=True)
+
+            if final_tools:
+                all_messages.append({"role": "assistant", "content": final_text or ""})
+                for tc in final_tools:
+                    set_role(role)
+                    name = tc.get("name")
+                    call_id = tc.get("id", name)
+                    args = tc.get("arguments", {})
+                    result = await call_tool(name, args)
+                    extra["tool_calls"].append({
+                        "name": name,
+                        "args": args,
+                        "result": result[:2000] if len(result) > 2000 else result
+                    })
+                    all_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result[:4000] if len(result) > 4000 else result
+                    })
+                final_text, _, _ = await self._llm_call(all_messages, allow_tools=False)
+
+            text = final_text or "Done. Review the results above."
+            if corrections:
+                text = "Note: assuming you meant " + ", ".join(corrections) + "\n\n" + text
+                extra["spelling_corrections"] = corrections
             return {
                 "response": text,
                 "messages": messages + [{"role": "assistant", "content": text}],
                 "extra": extra
             }
 
-        text = response_text or "No response from agent."
         return {
-            "response": text,
-            "messages": messages + [{"role": "assistant", "content": text}],
+            "response": "Retried multiple times but could not process. Please rephrase.",
+            "messages": messages,
             "extra": {}
         }
 
+    async def run_stream(self, messages: list, role: str = "admin"):
+        set_role(role)
+        corrected = _correct_spelling(messages)
+        corrections = []
+        for m in corrected:
+            corr = m.pop("_corrections", None) if isinstance(m, dict) else None
+            if corr:
+                corrections.extend(corr)
+        system_msg = {"role": "system", "content": make_system_prompt(role)}
+        all_messages = [system_msg] + corrected
+
+        for loop_attempt in range(3):
+            yield {"type": "thinking"}
+            response_text, tool_calls, assistant_msg = await self._llm_call(all_messages)
+
+            if not tool_calls:
+                text = response_text
+                if corrections:
+                    text = "Note: assuming you meant " + ", ".join(corrections) + "\n\n" + text
+                if text and not text.startswith("Error:"):
+                    yield {"type": "done", "response": text, "messages": messages + [{"role": "assistant", "content": text}], "extra": {"spelling_corrections": corrections} if corrections else {}}
+                    return
+                if loop_attempt < 2:
+                    yield {"type": "retry", "reason": "empty"}
+                    continue
+                yield {"type": "done", "response": text or "I encountered an issue processing your request. Please try again.", "messages": messages + [{"role": "assistant", "content": text or ""}], "extra": {"spelling_corrections": corrections} if corrections else {}}
+                return
+
+            all_messages.append(assistant_msg)
+            extra = {"tool_calls": []}
+
+            for tc in tool_calls:
+                set_role(role)
+                name = tc.get("name")
+                call_id = tc.get("id", name)
+                args = tc.get("arguments", {})
+                yield {"type": "tool_call", "name": name, "args": args}
+                result = await call_tool(name, args)
+                truncated = result[:2000] if len(result) > 2000 else result
+                extra["tool_calls"].append({"name": name, "args": args, "result": truncated})
+                yield {"type": "tool_result", "name": name, "result": truncated}
+                all_messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result[:4000] if len(result) > 4000 else result
+                })
+
+            yield {"type": "thinking"}
+            final_text, final_tools, _ = await self._llm_call(all_messages, allow_tools=True)
+
+            if final_tools:
+                all_messages.append({"role": "assistant", "content": final_text or ""})
+                for tc in final_tools:
+                    set_role(role)
+                    name = tc.get("name")
+                    call_id = tc.get("id", name)
+                    args = tc.get("arguments", {})
+                    yield {"type": "tool_call", "name": name, "args": args}
+                    result = await call_tool(name, args)
+                    truncated = result[:2000] if len(result) > 2000 else result
+                    extra["tool_calls"].append({"name": name, "args": args, "result": truncated})
+                    yield {"type": "tool_result", "name": name, "result": truncated}
+                    all_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result[:4000] if len(result) > 4000 else result
+                    })
+                yield {"type": "thinking"}
+                final_text, _, _ = await self._llm_call(all_messages, allow_tools=False)
+
+            text = final_text or "Done. Review the results above."
+            if corrections:
+                text = "Note: assuming you meant " + ", ".join(corrections) + "\n\n" + text
+                extra["spelling_corrections"] = corrections
+            yield {"type": "done", "response": text, "messages": messages + [{"role": "assistant", "content": text}], "extra": extra}
+            return
+
+        yield {"type": "done", "response": "Retried multiple times but could not process. Please rephrase.", "messages": messages, "extra": {}}
+
     async def _llm_call(self, messages: list, allow_tools: bool = True) -> tuple:
         if not OPENROUTER_API_KEY:
-            return "Error: OPENROUTER_API_KEY environment variable not set.", [], {}
+            return "Error: OPENROUTER_API_KEY not configured.", [], {}
 
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -128,13 +304,13 @@ class Agent:
         models_to_try = list(self._models)
         last_error = ""
 
-        for model_idx, model in enumerate(models_to_try):
+        for model in models_to_try:
             payload = {
                 "model": model,
                 "messages": messages,
                 "max_tokens": OPENROUTER_MAX_TOKENS,
             }
-            if allow_tools and model_idx == 0:
+            if allow_tools:
                 payload["tools"] = self.tool_defs
                 payload["tool_choice"] = "auto"
 
@@ -172,7 +348,18 @@ class Agent:
                 choice = data.get("choices", [{}])[0]
                 msg = choice.get("message", {})
                 content = msg.get("content") or ""
+                finish_reason = choice.get("finish_reason", "")
                 tool_calls_raw = msg.get("tool_calls", [])
+
+                if not content and not tool_calls_raw and finish_reason != "tool_calls":
+                    last_error = f"empty_response (finish_reason={finish_reason})"
+                    if attempt < 2:
+                        await asyncio.sleep(1)
+                        continue
+                    _logger.warning("llm_empty_response", extra={
+                        "model": model, "finish_reason": finish_reason
+                    })
+                    return "", [], {}
 
                 tool_calls = []
                 for tc in tool_calls_raw:
@@ -190,10 +377,9 @@ class Agent:
 
                 return content, tool_calls, msg
 
-            if model_idx < len(models_to_try) - 1:
-                _logger.info("fallback_model", extra={
-                    "from": model, "to": models_to_try[model_idx + 1], "reason": last_error
-                })
+            _logger.info("model_failed", extra={
+                "model": model, "error": last_error, "falling_back": bool(models_to_try)
+            })
 
         err_msg = f"All models failed. Last error: {last_error}"
         _logger.error("all_models_failed", extra={"error": last_error})

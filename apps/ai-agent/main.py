@@ -1,10 +1,10 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import os, json, time, logging, asyncio
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from agent import Agent
+from agent import Agent, OPENROUTER_API_KEY
 from tools import ROLE_TOKENS, _kubectl
 
 logging.basicConfig(
@@ -182,7 +182,7 @@ HTML = """<!DOCTYPE html>
     if (type === 'bot' && extra?.tool_calls) {
       let html = content;
       for (const tc of extra.tool_calls) {
-        html += '<div class="tool-call"><div class="name">🔧 ' + tc.name + '</div><div class="args">' + escapeHtml(JSON.stringify(tc.args, null, 2)) + '</div>';
+        html += '<div class="tool-call"><div class="name">&#128295; ' + tc.name + '</div><div class="args">' + escapeHtml(JSON.stringify(tc.args, null, 2)) + '</div>';
         if (tc.result !== undefined) {
           const cls = tc.result.startsWith('Error') ? 'result error' : 'result';
           html += '<div class="' + cls + '">' + escapeHtml(tc.result.substring(0, 1000)) + '</div>';
@@ -195,9 +195,49 @@ HTML = """<!DOCTYPE html>
     }
     chat.appendChild(div);
     chat.scrollTop = chat.scrollHeight;
+    return div;
+  }
+
+  async function typeMsg(div, text, speed) {
+    speed = speed || 15;
+    div.textContent = '';
+    for (let i = 0; i < text.length; i++) {
+      div.textContent += text[i];
+      if (i % 3 === 0) chat.scrollTop = chat.scrollHeight;
+      await new Promise(r => setTimeout(r, speed));
+    }
+    chat.scrollTop = chat.scrollHeight;
   }
 
   function escapeHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+  function addToolCall(container, tc) {
+    var div = document.createElement('div');
+    div.className = 'tool-call';
+    div.innerHTML = '<div class="name">&#128295; ' + tc.name + '</div><div class="args">' + escapeHtml(JSON.stringify(tc.args, null, 2)) + '</div>';
+    if (tc.result !== undefined) {
+      var cls = tc.result.startsWith('Error') ? 'result error' : 'result';
+      div.innerHTML += '<div class="' + cls + '">' + escapeHtml(tc.result.substring(0, 1000)) + '</div>';
+    }
+    container.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function setThinking(el, on) {
+    if (!el) return;
+    var existing = el.querySelector('.thinking-indicator');
+    if (on) {
+      if (!existing) {
+        var ind = document.createElement('div');
+        ind.className = 'thinking-indicator';
+        ind.innerHTML = '<div class="loading active" style="display:flex;margin:4px 0"><div class="spinner"></div><span>Thinking...</span></div>';
+        el.appendChild(ind);
+        chat.scrollTop = chat.scrollHeight;
+      }
+    } else {
+      if (existing) existing.remove();
+    }
+  }
 
   async function send() {
     const msg = input.value.trim();
@@ -207,7 +247,7 @@ HTML = """<!DOCTYPE html>
     loading.classList.add('active');
     sendBtn.disabled = true;
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({session_id: sessionId, message: msg, role: currentRole})
@@ -216,13 +256,79 @@ HTML = """<!DOCTYPE html>
         addMsg('bot error', 'Rate limit exceeded. Please wait before sending another request.');
         return;
       }
-      const data = await res.json();
-      if (data.error) { addMsg('bot error', data.error); return; }
-      if (data.rate_limit) {
-        const hdr = data.rate_limit;
-        if (parseInt(hdr.remaining) < 3) healthStatus.textContent = 'Rate limit: ' + hdr.remaining + ' remaining';
+      if (!res.ok) {
+        addMsg('bot error', 'Server error: ' + res.status);
+        return;
       }
-      addMsg('bot', data.response, data.extra || {});
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let botDiv = null;
+      let toolCallsData = [];
+      let finalResponse = '';
+      let streamDone = false;
+
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, {stream: true});
+        var lines = buffer.split('\\n');
+        buffer = lines.pop() || '';
+        for (var line of lines) {
+          line = line.trim();
+          if (!line.startsWith('data: ')) continue;
+          try {
+            var event = JSON.parse(line.slice(6));
+          } catch(e) { continue; }
+
+          if (event.type === 'thinking') {
+            if (!botDiv) { botDiv = addMsg('bot', ''); }
+            setThinking(botDiv, true);
+          } else if (event.type === 'tool_call') {
+            if (!botDiv) { botDiv = addMsg('bot', ''); }
+            setThinking(botDiv, false);
+            var tcEntry = {name: event.name, args: event.args};
+            toolCallsData.push(tcEntry);
+            addToolCall(botDiv, tcEntry);
+          } else if (event.type === 'tool_result') {
+            var lastTc = toolCallsData[toolCallsData.length - 1];
+            if (lastTc) { lastTc.result = event.result; }
+            botDiv.textContent = '';
+            for (var t of toolCallsData) { addToolCall(botDiv, t); }
+            setThinking(botDiv, false);
+          } else if (event.type === 'done') {
+            finalResponse = event.response || '';
+            if (!botDiv) { botDiv = addMsg('bot', ''); }
+            setThinking(botDiv, false);
+            if (event.extra && event.extra.tool_calls) {
+              toolCallsData = event.extra.tool_calls;
+              botDiv.textContent = '';
+              for (var t of toolCallsData) { addToolCall(botDiv, t); }
+              var textDiv = document.createElement('div');
+              textDiv.style.marginTop = '8px';
+              botDiv.appendChild(textDiv);
+              await typeMsg(textDiv, finalResponse);
+            } else {
+              botDiv.textContent = '';
+              await typeMsg(botDiv, finalResponse);
+            }
+            streamDone = true;
+          } else if (event.type === 'error') {
+            addMsg('bot error', event.error || 'Stream error');
+            streamDone = true;
+          }
+        }
+      }
+      if (!streamDone) {
+        if (finalResponse) {
+          if (!botDiv) { botDiv = addMsg('bot', ''); }
+          botDiv.textContent = '';
+          await typeMsg(botDiv, finalResponse);
+        } else {
+          if (!botDiv) { botDiv = addMsg('bot', ''); }
+          if (!botDiv.textContent.trim()) botDiv.textContent = 'Done.';
+        }
+      }
     } catch(e) {
       addMsg('bot error', 'Connection error: ' + e.message);
     } finally {
@@ -279,26 +385,21 @@ async def health():
         checks["details"]["openrouter"] = "configured"
     else:
         checks["details"]["openrouter"] = "missing_api_key"
-        checks["status"] = "degraded"
     if ROLE_TOKENS:
         loaded = list(ROLE_TOKENS.keys())
         checks["details"]["tokens"] = loaded
     else:
         checks["details"]["tokens"] = "none_loaded"
-        checks["status"] = "degraded"
     if _redis:
         try:
             await _redis.ping()
             checks["details"]["redis"] = "connected"
         except:
             checks["details"]["redis"] = "disconnected"
-            if checks["status"] == "ok":
-                checks["status"] = "degraded"
     else:
         checks["details"]["redis"] = "in-memory"
     checks["details"]["sessions"] = len(sessions)
-    status_code = 200 if checks["status"] == "ok" else 503
-    return JSONResponse(content=checks, status_code=status_code)
+    return JSONResponse(content=checks, status_code=200)
 
 @app.get("/ready")
 async def ready():
@@ -352,6 +453,48 @@ async def chat(req: Request):
     except Exception as e:
         _logger.error("chat_error", extra={"session": session_id[:8], "error": str(e)})
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: Request):
+    body = await req.json()
+    msg = body.get("message", "")
+    if not msg.strip():
+        return JSONResponse(status_code=400, content={"error": "Message is empty"})
+    session_id = body.get("session_id", "default")
+    role = body.get("role", "admin")
+
+    if role not in ("viewer", "edit", "admin"):
+        role = "admin"
+
+    if not _check_rate_limit(session_id):
+        headers = _rate_limit_headers(session_id)
+        return JSONResponse(status_code=429, content={"error": "Rate limit exceeded."}, headers=headers)
+
+    session = await _load_session(session_id)
+    if session is None:
+        session = {"messages": [], "role": role}
+
+    session["role"] = role
+    session["messages"].append({"role": "user", "content": msg.strip()})
+
+    if len(session["messages"]) > MAX_HISTORY * 2:
+        session["messages"] = session["messages"][-MAX_HISTORY:]
+
+    async def event_stream():
+        try:
+            _logger.info("stream_start", extra={"session": session_id[:8], "role": role, "msg_len": len(msg)})
+            async for event in agent.run_stream(session["messages"], role=role):
+                data = json.dumps(event)
+                yield f"data: {data}\n\n"
+                if event.get("type") == "done":
+                    session["messages"] = event.get("messages", session["messages"])
+                    await _save_session(session_id, session)
+                    break
+        except Exception as e:
+            _logger.error("stream_error", extra={"session": session_id[:8], "error": str(e)})
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
